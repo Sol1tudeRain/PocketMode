@@ -226,6 +226,18 @@ final class PocketController implements SensorEventListener {
                 });
 
         context.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(PocketPowerHook.WAKE_REQUEST), false,
+                new ContentObserver(main) {
+                    @Override public void onChange(boolean selfChange) {
+                        if (!enabled || !near || bypass || overlay != null) return;
+                        Log.i(TAG, "POWER prearm request: attach pocket overlay before wake");
+                        main.removeCallbacks(showRunnable);
+                        pending = false;
+                        maybeShow();
+                    }
+                });
+
+        context.getContentResolver().registerContentObserver(
                 Settings.Global.getUriFor(PocketPowerHook.READY_ACK), false,
                 new ContentObserver(main) {
                     @Override public void onChange(boolean selfChange) {
