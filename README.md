@@ -1,45 +1,62 @@
-# PocketMode v1.5 — On-demand proximity and gesture-shield experiment
+# PocketMode v1.6 — wake-triggered proximity and AOD notification screening
 
-An experimental LSPosed port adapting the *architecture* of crDroid / Paranoid Android's pocket protection to PixelOS Android 17.
+Experimental LSPosed module for Android 17 PixelOS, inspired by crDroid's
+pocket service architecture (original upstream Apache-2.0). This is not an
+Android ROM patch and **has not been confirmed on the target device**.
 
-## Requirements and setup
+## LSPosed setup
 
-- PixelOS / Android 17, working proximity sensor, working LSPosed in `android` (system_server) process.
-- Enable **only `android`** in LSPosed; this implementation does not inject into SystemUI or Pixel Launcher.
-- Reboot the entire device after installing.
-- Open PocketMode: only one master enable/disable switch, default ON; there is no per-app whitelist.
-- **Keep a working recovery path.** This is not device-tested code. If system_server has trouble, disable the LSPosed module in recovery or using LSPosed's safe-mode mechanism.
+**Required scopes:** `android` (system_server) **and**
+`com.android.systemui`. Fully reboot after updating. The module app has
+one ON/OFF switch, default ON.
 
-## How it works
+Keep the previous APK available for recovery. Changes to system_server hooks
+are experimental; if problems occur disable the module from LSPosed/recovery.
 
-**Proximity:** `CrPocketController` uses crDroid's sensor-service pattern: a dedicated `HandlerThread`, an on-change proximity sensor, a 400,000µs requested sample interval, and proximity registration only while the screen is interactive. On SCREEN_OFF it removes the overlay and unregisters the sensor immediately. On SCREEN_ON (touch/power/notification that actually wakes the display), it requests a new proximity reading. An ordinary FCM push without screen wake does not register the sensor. It also activates while unlocked, as requested. FAR requests immediate removal.
+## Screen-on and screen-off behavior
 
-**AOD limitation:** A notification-only ambient Doze pulse may not emit SCREEN_ON; in that case this version deliberately leaves proximity disabled to avoid always-on standby monitoring. Handling noninteractive AOD pulses requires a separate Doze trigger and is not claimed as supported here.
-
-**Independent UI thread:** A separate `PocketModeWindowUi` HandlerThread runs overlay lifecycle operations; a long-running system_server main-loop / navigation animation should no longer delay FAR dismissal. If a proximity sensor stops reporting while the overlay is active, one rearm requests a fresh HAL sample after 6.5 seconds; this is not an automatic overlay timeout.
-
-**Overlay:** Privileged `TYPE_SYSTEM_ERROR` window (rather than crDroid's `TYPE_SECURE_SYSTEM_OVERLAY`, which Android 17 forces `FLAG_NOT_TOUCHABLE`). A full-screen touch-absorbing View blocks app taps. The window uses `INPUT_FEATURE_DISABLE_USER_ACTIVITY` so touching does not prolong the screen-off timeout. Status bar/QS expansion is temporarily disabled and restored on dismiss.
-
-**System navigation gestures:** `PocketInputShield` starts a native Android `InputManager.monitorGestureInput` observer only when the overlay is prepared. On touchscreen `ACTION_DOWN`, `InputMonitor.pilferPointers()` takes the stream away from other input channels (including SystemUI edge-back and Quickstep home/recents gesture recognizers). It disposes the monitor immediately when the overlay is hidden; the receiver event is always finished normally. Android channels marked `DO_NOT_PILFER` cannot be canceled by this API, so **actual PixelOS behavior must be tested**.
-
-**Long POWER:** An LSPosed `PhoneWindowManager.powerLongPress` hook in the same system_server process cancels the global-actions menu and hides the overlay. Override persists until the proximity sensor reports FAR. Emergency key combinations are not modified.
+- When the display goes to sleep, `CrPocketController` immediately removes
+  its overlay, shuts down its gesture monitor and unregisters proximity.
+  **No continuous proximity listener while the display is completely asleep.**
+- On actual wake, `PhoneWindowManager.startedWakingUp` posts a sensor
+  registration early; the `ACTION_SCREEN_ON` broadcast is a fallback and
+  does not redundantly unregister/re-register the same sensor.
+- Proximity `NEAR` while interactive requests a full-screen input-blocking
+  overlay. `FAR` immediately removes it. The POWER long press escape stays
+  in system_server, and normal auto screen-off is preserved.
+- A locked-screen notification might generate only an ambient Doze/AOD pulse,
+  **not** `SCREEN_ON`. In SystemUI, `PocketDozeHook` intercepts
+  `DozeTriggers.onNotification` and uses its existing `ProximityCheck`
+  to sample only when a notification pulse is requested (500 ms maximum
+  sensor check, 850 ms safety fallback). If **NEAR**, it suppresses that
+  Doze pulse; **FAR/UNKNOWN/error** retains the original pulse.
+  The push notification itself is not discarded or silenced.
+- Continuous AOD that's already on is not forcibly turned off by this hook;
+  that requires separate AOD lifecycle handling.
+- The full system gesture shield uses an Android `InputMonitor` and
+  `pilferPointers()` while the pocket overlay is visible. Android channels
+  marked `DO_NOT_PILFER` may still be able to receive system gestures.
 
 ## Debugging
 
-Use Termux:
+In Termux after a power wake and a notification pulse:
 
 ```sh
-su -c 'logcat -d -s PocketModeCr:V PocketModeInput:V PocketModePower:V | tail -n 80'
+su -c 'logcat -d -s PocketModeCr:V PocketModePower:V PocketModeInput:V PocketModeDoze:V | tail -n 100'
 ```
 
-`su -c` runs the log command with root privileges, `-s` selects the three module log tags, and `tail -n 80` keeps the newest 80 lines.
+The logs show whether the framework received `startedWakingUp`, whether
+proximity registration and an initial sensor reading succeeded, whether
+the gesture monitor attached, and whether SystemUI's one-shot AOD check
+succeeded or fell back.
 
-If native input monitoring cannot be registered, the overlay is **not** displayed; the module fails open rather than letting navigation gestures trigger behind an opaque touch blocker. This experimental port has passed APK compilation, not an end-to-end PixelOS device test.
+## Limits
 
-## Attribution and origin
+Only Doze notification pulses that pass through
+`com.android.systemui.doze.DozeTriggers.onNotification` are intercepted.
+Vendor-specific display-wake paths might require their own integration.
+No mechanism here intercepts unrelated FCM messages or monitors sensors
+continuously while asleep.
 
-The original pocket service/controller inspiration comes from Paranoid Android and crDroid (Apache-2.0); Android's `InputManager`, `InputMonitor` and native `InputDispatcher` gesture-pilfer APIs provide the separate navigation gesture interception:
-- https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
-- https://github.com/crdroidandroid/android_frameworks_native/tree/17.0
-
-This project does not install crDroid's ROM-specific `android.pocket` system service into PixelOS.
+Original crDroid framework reference:
+https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
