@@ -1,39 +1,36 @@
-# PocketMode — LSPosed SystemUI + Android framework
+# PocketMode — LSPosed for PixelOS Android 17
 
-A pocket mode experiment for PixelOS Android 17 with a native SystemUI overlay and a power-key escape policy hook.
+Pocket protection using a native SystemUI overlay plus a power-key escape hook in Android framework.
 
-## Features
+## Settings
 
-- Starts enabled by default on first installation. Open **PocketMode** from the launcher for an on/off switch, five-second UI test, and searchable foreground-app whitelist.
-- When the proximity sensor reports NEAR, shows the crDroid-style pocket overlay in both locked and unlocked states, except while a whitelisted application is in the foreground.
-- Touches are intercepted by the overlay and marked with **`WindowManager.LayoutParams.INPUT_FEATURE_DISABLE_USER_ACTIVITY`** (hidden platform input feature value 2). Thus touches delivered to the overlay should not reset the normal screen-off timer.
-- When the distance sensor reports FAR, the overlay is removed. A regular short power press still turns off the display.
-- **Long POWER while the overlay is active:** Android framework `PhoneWindowManager.powerLongPress` hook signals SystemUI to dismiss pocket protection and suppresses the normal software power menu for that key hold. Also intercepts `powerVeryLongPress` for the same hold. Detection remains bypassed until FAR.
-- **No 15-second auto dismissal for a normal pocket overlay.** Only the manual five-second UI test auto-closes.
-- Safety: normal indefinite overlay is not allowed until the SystemUI controller confirms that `system_server` has installed the long-power hook in this boot. Active overlays advertise an expiring status heartbeat. If the status is stale, the framework will not suppress normal power-key behavior.
-- Attempts to suppress Doze notification screen pulses while in pocket.
+Open the **PocketMode** app from the launcher. There is exactly **one master ON/OFF switch**, enabled by default. There is **no application whitelist** and **no foreground-app polling**.
 
-## Installation and scope
+## Behavior
 
-1. Stop the older KernelSU PocketGuard module if installed.
-2. Install the APK.
-3. In LSPosed enable the module with **two scopes**:
-   - **System UI**: `com.android.systemui`
-   - **System framework / Android**: `android` (the `system_server` process)
-4. Reboot the phone. The feature is enabled automatically; no Termux commands needed.
-5. Open **PocketMode** in the launcher to use the master switch or edit the whitelist. The UI test button displays a removable five-second preview.
+- Proximity NEAR triggers a full-screen SystemUI overlay, on both the lock screen and unlocked apps.
+- The overlay consumes touches, covers the system navigation bar, and temporarily restricts status bar/quick settings expansion.
+- Touching the overlay does not refresh the normal screen-off timer.
+- Proximity FAR (confirmed after 100 ms) removes the overlay.
+- Long POWER exits the overlay without opening the power menu for that hold.
+- Ordinary short POWER can switch the screen off.
+- No automatic 15-second dismissal on the normal overlay.
+- Doze pulse suppression is attempted when pocket mode is active.
+- Unavailable power-key escape Hook prevents an indefinite overlay from activating, as a fail-safe.
 
-## Important caveats
+## Install
 
-- Experimental; neither `PhoneWindowManager` hooks nor privileged window permission have been verified on the target phone. On ROMs where the power hook cannot attach, normal pocket overlays stay disabled by design.
-- The module does **not** disable hardware power-button emergency shutdown combinations.
-- When locked or screen off, Android or vendor power behavior may vary.
-- If SystemUI or system_server becomes unstable, disable the module in LSPosed and reboot; keep a recovery route available.
-- Automatic screen-off follows the user's normal Android display timeout settings; the module does not modify their value.
-- Foreground whitelist uses SystemUI's privileged `ActivityManager.getRunningTasks(1)` access, which can differ by ROM.
-- Logs: `logcat -d -s PocketGuardLSP:V PocketGuardPower:V | tail -n 100`.
+1. Install the signed APK.
+2. In LSPosed enable both **com.android.systemui** (System UI) and **android** (Android system framework / system_server) scopes.
+3. Fully reboot the phone.
+4. Open the PocketMode app to use the master switch.
+
+v1.0 is signed with the same certificate as v0.7–v0.9 **fixed-signature** releases, allowing an in-place update from those versions. GitHub Actions uploads unsigned release APKs; they require private signing with the stable key, which is never published in this repository.
+
+## Limitations
+
+Experimental Android framework hooking, not fully validated on the target PixelOS Android 17 device. If a SystemUI or system_server issue occurs, disable PocketMode in LSPosed and reboot. Don't use old transient debug-signed APKs as updates to stable-signed releases.
 
 ## Credits
 
-Interface follows crDroid 17; vector derived from Paranoid Android (2024, Apache-2.0).
-https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
+Pocket UI follows crDroid 17. Phone illustration derived from Paranoid Android (2024, Apache-2.0).
