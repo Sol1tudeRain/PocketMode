@@ -1,4 +1,4 @@
-# PocketMode v2.2
+# PocketMode v2.3
 
 Based on v1.9 for PixelOS. Select Android System Framework (`android`) and System UI (`com.android.systemui`) in
 LSPosed and reboot after installing.
@@ -10,7 +10,7 @@ wake. When covered it prepares the opaque pocket window and gesture shield.
 If rendering requires the display to start, it can delay the default
 display screen-on callback until the first pocket frame commits. Both waits
 are bounded so a failed sensor or renderer cannot leave the panel blocked.
-A covered ambient display requests sleep and does not show the pocket UI.
+Framework doze display requests stay OFF pending proximity. Covered requests keep the dream running with the panel off.
 Hold POWER for 3 seconds while the pocket window is visible to dismiss it.
 
 ## v1.9: recovered raw proximity data after covered power wake

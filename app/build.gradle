@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 22
-        versionName '2.2-notification-proximity'
+        versionCode 23
+        versionName '2.3-dream-display'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

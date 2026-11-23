@@ -63,6 +63,8 @@ public final class PocketPowerHook {
 
     private PocketPowerHook() { }
 
+    static CrPocketController controller() { return controller; }
+
     static boolean isEscapeInstalled() { return escapeInstalled; }
 
     private static void installTouchTimeoutHook(ClassLoader loader) {
@@ -91,6 +93,7 @@ public final class PocketPowerHook {
 
     static void install(XC_LoadPackage.LoadPackageParam lp) {
         installTouchTimeoutHook(lp.classLoader);
+        PocketDreamHook.install(lp.classLoader);
         try {
             Class<?> policy = XposedHelpers.findClassIfExists(
                     "com.android.server.policy.PhoneWindowManager", lp.classLoader);
@@ -169,17 +172,14 @@ public final class PocketPowerHook {
                     Object original = p.args[1];
                     if ((int) p.args[0] != Display.DEFAULT_DISPLAY || c == null
                             || !c.canCheckPowerWake() || original == null) return;
-                    boolean manual = c.isManualWake();
-                    Context ctx = (Context) XposedHelpers.getObjectField(p.thisObject, "mContext");
-                    if (!manual && ctx.getSystemService(PowerManager.class).isInteractive()) return;
+                    if (!c.isManualWake()) return;
                     p.args[1] = Proxy.newProxyInstance(listenerType.getClassLoader(),
                             new Class<?>[]{listenerType}, (proxy, method, args) -> {
                                 if (!method.getName().equals("onScreenOn"))
                                     return method.invoke(original, args);
                                 Runnable unblock = () -> handler.post(() ->
                                         XposedHelpers.callMethod(original, "onScreenOn"));
-                                if (manual) c.whenScreenReady(unblock);
-                                else c.whenAmbientReady(unblock);
+                                c.whenScreenReady(unblock);
                                 return null;
                             });
                 }

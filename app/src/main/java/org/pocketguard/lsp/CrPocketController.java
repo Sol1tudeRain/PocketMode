@@ -60,8 +60,8 @@ final class CrPocketController {
     private PowerManager.WakeLock probeLock;
     private boolean waitingForFrame;
     private Runnable screenReady;
-    private Runnable ambientReady;
-    private boolean ambientSleepRequested;
+    private java.util.function.Consumer<Boolean> dreamDecision;
+    private PowerManager.WakeLock dreamProbeLock;
     private Runnable wakeTimeout;
     private volatile boolean manualWake;
     private boolean frameReady;
@@ -114,7 +114,6 @@ final class CrPocketController {
                 + " source=" + source + " displayState=" + displayState);
         if (near) {
             if (isAmbient() && !manualWake) {
-                if (ambientReady == null) sleepAmbient();
                 return;
             }
             main.removeCallbacks(showIfStillNear);
@@ -135,7 +134,7 @@ final class CrPocketController {
             final float a = event.values[0];
             final float b = event.values.length > 1 ? event.values[1] : Float.NaN;
             main.post(() -> {
-                if (!enabled || (!displayLit && !manualWake && ambientReady == null) || !listening || epoch != sensorEpoch)
+                if (!enabled || (!displayLit && !manualWake && dreamDecision == null) || !listening || epoch != sensorEpoch)
                     return;
                 if (type == RAW_TYPE) {
                     if (!rawListening || Float.isNaN(b)) return;
@@ -152,7 +151,7 @@ final class CrPocketController {
                         rawDecisive = true;
                         updateNear(rawNear, "RAW adc0=" + a + " adc1=" + b);
                         if (manualWake) decidePowerWake(rawNear);
-                        else decideAmbient(rawNear);
+                        else if (dreamDecision != null) dreamDecision.accept(rawNear);
                     }
                 } else if (!rawListening || !rawDecisive) {
                     // Fallback only until the factory ADC provides a
@@ -162,7 +161,7 @@ final class CrPocketController {
                     if (!manualWake || !rawListening) {
                         updateNear(standardCovered, "STANDARD distance=" + a);
                         if (manualWake) decidePowerWake(standardCovered);
-                        else if (!rawListening) decideAmbient(standardCovered);
+                        else if (!rawListening && dreamDecision != null) dreamDecision.accept(standardCovered);
                     }
                 }
             });
@@ -269,7 +268,6 @@ final class CrPocketController {
             if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
             releaseScreen();
         }
-        if (nextState == Display.STATE_OFF) finishAmbient();
         displayState = nextState;
         displayLit = isLit(nextState);
         Log.i(TAG, "Display state=" + nextState + " lit=" + displayLit);
@@ -277,12 +275,13 @@ final class CrPocketController {
     }
 
     private void applySensorState() {
-        if (!enabled || (!displayLit && !manualWake && ambientReady == null)) {
+        if (!enabled || (!displayLit && !manualWake && dreamDecision == null)) {
             main.removeCallbacks(showIfStillNear);
             hideOverlay();
             stopSensor();
             if (!enabled) {
-                finishAmbient();
+                if (dreamDecision != null) dreamDecision.accept(false);
+                clearDreamProbe();
                 manualWake = false;
                 resumeWake();
                 releaseScreen();
@@ -292,7 +291,6 @@ final class CrPocketController {
         startSensor();
         if (isAmbient() && !manualWake) {
             hideOverlay();
-            if (near && !bypassUntilFar) sleepAmbient();
         } else if (canShow() && near && !bypassUntilFar) {
             main.post(showIfStillNear);
         }
@@ -306,17 +304,6 @@ final class CrPocketController {
 
     private boolean canShow() {
         return manualWake || (displayState == Display.STATE_ON && !isAmbient());
-    }
-
-    private void sleepAmbient() {
-        PowerManager pm = systemContext.getSystemService(PowerManager.class);
-        if (pm == null || pm.isInteractive() || bypassUntilFar) return;
-        try {
-            // GO_TO_SLEEP_REASON_APPLICATION, GO_TO_SLEEP_FLAG_NO_DOZE
-            XposedHelpers.callMethod(pm, "goToSleep", android.os.SystemClock.uptimeMillis(), 0, 1);
-        } catch (Throwable t) {
-            Log.w(TAG, "Could not blank covered ambient display", t);
-        }
     }
 
     boolean canCheckPowerWake() {
@@ -337,7 +324,7 @@ final class CrPocketController {
                 return;
             }
             manualWake = true;
-            finishAmbient();
+            clearDreamProbe();
             pendingWake = wake;
             // POWER-up may release the policy wake lock before the RAW sample arrives.
             // A partial lock runs the probe without lighting the panel.
@@ -392,47 +379,40 @@ final class CrPocketController {
 
     }
 
-    // The display policy can ask to unblock the first AOD frame before
-    // DisplayManager publishes DOZE. Sample while that callback is pending.
-    void whenAmbientReady(Runnable unblock) {
+    // Process probe start/stop in the same order as DreamManager requests.
+    void setDreamProbe(java.util.function.Consumer<Boolean> decision) {
         main.post(() -> {
-            finishAmbient();
-            PowerManager pm = systemContext.getSystemService(PowerManager.class);
-            if (!enabled || manualWake || bypassUntilFar || pm == null || pm.isInteractive()) {
-                unblock.run();
+            clearDreamProbe();
+            if (decision == null || !enabled || manualWake || bypassUntilFar) {
+                if (decision != null) decision.accept(false);
+                applySensorState();
                 return;
             }
-            ambientReady = unblock;
-            ambientSleepRequested = false;
+            dreamDecision = decision;
+            if (dreamProbeLock == null) {
+                dreamProbeLock = systemContext.getSystemService(PowerManager.class)
+                        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketMode:dream-probe");
+                dreamProbeLock.setReferenceCounted(false);
+            }
+            dreamProbeLock.acquire(1000);
             startSensor();
-            main.postDelayed(ambientDeadline, 850);
-            if (rawDecisive || (!rawListening && standardSample)) decideAmbient(near);
+            if (rawDecisive || (!rawListening && standardSample)) decision.accept(near);
+            else main.postDelayed(dreamTimeout, 700);
         });
     }
 
-    private final Runnable ambientDeadline = () -> {
-        finishAmbient();
-        if (!displayLit && !manualWake) applySensorState();
-    };
+    private final Runnable dreamTimeout = this::resolveDreamTimeout;
 
-    private void decideAmbient(boolean covered) {
-        if (ambientReady == null) return;
-        if (!covered) {
-            finishAmbient();
-        } else if (!ambientSleepRequested) {
-            ambientSleepRequested = true;
-            sleepAmbient();
+    private void resolveDreamTimeout() {
+        if (dreamDecision != null && !rawDecisive) {
+            dreamDecision.accept(standardSample && standardCovered);
         }
     }
 
-    private void finishAmbient() {
-        main.removeCallbacks(ambientDeadline);
-        Runnable callback = ambientReady;
-        ambientReady = null;
-        if (callback != null) {
-            callback.run();
-            if (!displayLit && !manualWake) stopSensor();
-        }
+    private void clearDreamProbe() {
+        main.removeCallbacks(dreamTimeout);
+        dreamDecision = null;
+        if (dreamProbeLock != null && dreamProbeLock.isHeld()) dreamProbeLock.release();
     }
 
     void whenScreenReady(Runnable unblock) {
