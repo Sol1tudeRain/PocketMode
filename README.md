@@ -1,4 +1,4 @@
-# PocketMode v1.3 — Android 17 framework gesture-shield experiment
+# PocketMode v1.5 — On-demand proximity and gesture-shield experiment
 
 An experimental LSPosed port adapting the *architecture* of crDroid / Paranoid Android's pocket protection to PixelOS Android 17.
 
@@ -12,7 +12,9 @@ An experimental LSPosed port adapting the *architecture* of crDroid / Paranoid A
 
 ## How it works
 
-**Proximity:** `CrPocketController` uses crDroid's sensor-service pattern: a dedicated `HandlerThread`, an on-change proximity sensor, a 400,000µs requested sample interval, and continued sensor listening during screen-off. It also activates while unlocked, as requested. Screen wake re-arms non-wakeup sensors once. FAR requests immediate removal.
+**Proximity:** `CrPocketController` uses crDroid's sensor-service pattern: a dedicated `HandlerThread`, an on-change proximity sensor, a 400,000µs requested sample interval, and proximity registration only while the screen is interactive. On SCREEN_OFF it removes the overlay and unregisters the sensor immediately. On SCREEN_ON (touch/power/notification that actually wakes the display), it requests a new proximity reading. An ordinary FCM push without screen wake does not register the sensor. It also activates while unlocked, as requested. FAR requests immediate removal.
+
+**AOD limitation:** A notification-only ambient Doze pulse may not emit SCREEN_ON; in that case this version deliberately leaves proximity disabled to avoid always-on standby monitoring. Handling noninteractive AOD pulses requires a separate Doze trigger and is not claimed as supported here.
 
 **Independent UI thread:** A separate `PocketModeWindowUi` HandlerThread runs overlay lifecycle operations; a long-running system_server main-loop / navigation animation should no longer delay FAR dismissal. If a proximity sensor stops reporting while the overlay is active, one rearm requests a fresh HAL sample after 6.5 seconds; this is not an automatic overlay timeout.
 
