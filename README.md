@@ -1,30 +1,38 @@
-# PocketMode — LSPosed SystemUI hook
+# PocketMode for PixelOS — LSPosed SystemUI module
 
-A prototype pocket-mode module for PixelOS Android 17, based on crDroid's pocket-mode UX. **Use at your own risk.**
+A SystemUI-based pocket protection experiment for Android 17, with an **app settings screen** and a **live foreground-app whitelist**.
 
-- Hooks only `com.android.systemui` (not system_server).
-- Draws a fullscreen lockscreen overlay inside SystemUI without launching an Activity.
-- Detects the proximity sensor with 120 ms confirmation.
-- Attempts to suppress standard Doze notification pulses in-pocket.
-- Uses a 15-second fail-safe and re-arms only after the proximity sensor reports FAR.
-- **Disabled by default**. No touchscreen EVIOCGRAB.
+## Features
 
-## Build
+- **Enabled by default** after installing the APK, enabling LSPosed scope and restarting.
+- Tap the **PocketMode** app icon for an ON/OFF switch; no Termux commands needed.
+- Search installed launcher applications and check apps that should be exempt from pocket protection.
+- While the proximity sensor reports NEAR and the display is interactive, show a fullscreen SystemUI overlay after a 120 ms confirmation; works both locked and unlocked.
+- Foreground whitelist is rechecked approximately every 700 ms while NEAR and interactive. Excluded foreground apps bypass the overlay.
+- Original Doze notification pulse suppression when NEAR and not excluded.
+- Uncover the sensor to remove the overlay immediately; screen off also removes it.
+- 15-second fail-open watchdog until sensor reports FAR; five-second manual overlay test button.
+- No separate Activity is launched when the pocket overlay appears.
 
-GitHub Actions automatically runs when the initial commit is pushed and uploads the debug APK as an artifact. The first workflow imports the full, self-contained source bundle and commits the expanded files to this repository for review; subsequent workflows build from the expanded sources.
+## Install
 
-## Install & test safely
+1. If you used the older KernelSU PocketGuard implementation, stop it or disable that module before using the LSPosed variant.
+2. Install the APK and enable the module in LSPosed with **SystemUI / com.android.systemui** scope.
+3. **Restart your phone once** so SystemUI loads the new hook.
+4. Open the **PocketMode** app from the launcher to toggle protection, edit the app whitelist, or display a five-second UI test.
+5. It starts enabled without a shell command. To turn it off, use the switch inside the app.
 
-1. Stop the old KernelSU PocketGuard before using this LSPosed version:
-   `su -c 'sh /data/adb/modules/pocketguard_aosp/pocketctl off'`
-2. Install `app-debug.apk` from GitHub Actions.
-3. Enable this module in LSPosed. Scope only `com.android.systemui`, then restart SystemUI/reboot.
-4. Enable explicitly from Termux: `su -c 'settings put global pocketguard_lsp_enabled 1'`
-5. Test on the lockscreen. Remove proximity obstruction to dismiss; a 15-second watchdog releases overlay touch.
-6. Disable: `su -c 'settings put global pocketguard_lsp_enabled 0'`
+Configuration is stored in the app's device-protected private preferences. SystemUI reads it through a provider restricted to the SystemUI UID and updates as the preferences change.
 
-**Caution:** PixelOS window authorization and Doze hooks are not yet tested on hardware. An LSPosed injection failure may crash SystemUI; verify you have a recovery path before enabling. The fallback volume-up escape is not guaranteed to receive keys.
+## Caveats
 
-## Credits
+- Prototype: not yet verified on PixelOS Android 17 hardware.
+- The whitelist relies on the privileged SystemUI process being able to call `ActivityManager.getRunningTasks(1)`. Check `PocketGuardLSP` logcat output if exclusions do not work; some ROMs may restrict this API.
+- Only ordinary touch input is blocked by the overlay; buttons and hardware touch behavior are not disabled.
+- The 15-second watchdog prioritizes safety over permanent pocket locking.
+- Previous `settings global pocketguard_lsp_enabled` is deliberately **not used** by this version; use the app UI.
+- If SystemUI stops working, disable this LSPosed module and reboot.
 
-Screen layout follows crDroid 17's `pocket_lock_view.xml`, and the vector phone illustration adapts code from Paranoid Android (2024), Apache-2.0. crDroid framework references: https://github.com/crdroidandroid/android_frameworks_base/tree/17.0 .
+## Licenses / credits
+
+The interface follows crDroid 17's pocket UI. The vector phone graphic is derived from Paranoid Android 2024 (Apache-2.0). See https://github.com/crdroidandroid/android_frameworks_base/tree/17.0 .
