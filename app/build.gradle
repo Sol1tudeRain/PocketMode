@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 32
-        versionCode 6
-        versionName '0.6-live-power-handshake'
+        versionCode 7
+        versionName '0.7-touch-proximity-fixed-signing'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
