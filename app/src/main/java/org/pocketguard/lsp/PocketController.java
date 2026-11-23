@@ -8,6 +8,8 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.ContentObserver;
 import android.graphics.PixelFormat;
+import android.view.MotionEvent;
+import android.widget.FrameLayout;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
@@ -37,9 +39,11 @@ final class PocketController implements SensorEventListener {
     private static final long CONFIRM_MS = 120;
     private static final long FOREGROUND_POLL_MS = 700;
     private static final long HEARTBEAT_MS = 3000;
+    private static final long SENSOR_RECHECK_MS = 1500;
     private static final int INPUT_FEATURE_DISABLE_USER_ACTIVITY = 2;
     private static final long TEST_MS = 5000;
-    private static final int TYPE_SECURE_SYSTEM_OVERLAY = 2015;
+    // TYPE_SECURE_SYSTEM_OVERLAY is intentionally excluded: Android's
+    // input policy treats it as non-touchable on several framework builds.
     private static final int TYPE_STATUS_BAR_SUB_PANEL = 2017;
     private static final int TYPE_APPLICATION_OVERLAY = 2038;
 
@@ -62,6 +66,56 @@ final class PocketController implements SensorEventListener {
     private int lastTestSequence = -1;
     private String lastTopPackage = "";
     private boolean warnedTaskFailure;
+    private long lastSensorEventElapsed;
+    private long overlayShownElapsed;
+    private int blockedTouchEvents;
+    private final Runnable sensorRecheck = new Runnable() {
+        @Override public void run() {
+            if (!enabled || !near || overlay == null || testWindow || sm == null || prox == null)
+                return;
+            // On-change proximity sensors sometimes do not send FAR promptly.
+            // Re-registering requests a fresh initial reading from the HAL.
+            long sinceEvent = SystemClock.elapsedRealtime() - lastSensorEventElapsed;
+            if (sinceEvent >= SENSOR_RECHECK_MS) {
+                try {
+                    sm.unregisterListener(PocketController.this, prox);
+                    boolean ok = sm.registerListener(PocketController.this, prox,
+                            SensorManager.SENSOR_DELAY_FASTEST, main);
+                    if (!ok) {
+                        Log.e(TAG, "Proximity re-registration failed; release touch safely");
+                        bypass = true;
+                        hide();
+                        return;
+                    }
+                    Log.d(TAG, "Requested proximity re-sample after " + sinceEvent + "ms");
+                } catch (Throwable e) {
+                    Log.e(TAG, "Proximity refresh failed; releasing overlay", e);
+                    bypass = true;
+                    hide();
+                    return;
+                }
+            }
+            main.postDelayed(this, SENSOR_RECHECK_MS);
+        }
+    };
+
+    private final class TouchBlocker extends FrameLayout {
+        TouchBlocker(Context c) {
+            super(c);
+            setClickable(true);
+            setFocusable(true);
+        }
+        @Override public boolean dispatchTouchEvent(MotionEvent event) {
+            if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                blockedTouchEvents++;
+                if (blockedTouchEvents <= 3 || blockedTouchEvents % 20 == 0) {
+                    Log.i(TAG, "Pocket overlay consumed touch #" + blockedTouchEvents);
+                }
+            }
+            // Never send the event to children or underlying apps.
+            return true;
+        }
+    }
     private long pendingPowerChallenge;
     private long verifiedPowerChallenge;
     private long lastPowerChallengeAt;
@@ -351,10 +405,14 @@ final class PocketController implements SensorEventListener {
     @Override public void onSensorChanged(SensorEvent event) {
         if (!enabled || event.sensor.getType() != Sensor.TYPE_PROXIMITY
                 || event.values == null || event.values.length == 0) return;
+        lastSensorEventElapsed = SystemClock.elapsedRealtime();
         boolean newNear = event.values[0] < event.sensor.getMaximumRange();
         if (newNear == near) return;
         near = newNear;
-        Log.i(TAG, "Proximity NEAR=" + near + " distance=" + event.values[0]);
+        Log.i(TAG, "Proximity NEAR=" + near + " distance=" + event.values[0]
+                + " elapsedMs=" + lastSensorEventElapsed
+                + " overlayAgeMs=" + (overlay == null ? -1
+                : lastSensorEventElapsed - overlayShownElapsed));
 
         if (!near) {
             bypass = false;
@@ -393,20 +451,22 @@ final class PocketController implements SensorEventListener {
         try {
             Context resources = context.createPackageContext(
                     "org.pocketguard.lsp", Context.CONTEXT_IGNORE_SECURITY);
-            View view = LayoutInflater.from(resources).inflate(R.layout.pocket_overlay, null);
-            view.setClickable(true);
-            view.setOnTouchListener((v, e) -> true);
+            View content = LayoutInflater.from(resources).inflate(R.layout.pocket_overlay, null);
+            TouchBlocker view = new TouchBlocker(context);
+            view.addView(content, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
             view.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+            blockedTouchEvents = 0;
             int flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                     | WindowManager.LayoutParams.FLAG_FULLSCREEN
                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED;
 
             Throwable last = null;
             for (int type : new int[]{
-                    TYPE_SECURE_SYSTEM_OVERLAY, TYPE_STATUS_BAR_SUB_PANEL,
-                    TYPE_APPLICATION_OVERLAY}) {
+                    TYPE_STATUS_BAR_SUB_PANEL, TYPE_APPLICATION_OVERLAY}) {
                 WindowManager.LayoutParams p = new WindowManager.LayoutParams(
                         WindowManager.LayoutParams.MATCH_PARENT,
                         WindowManager.LayoutParams.MATCH_PARENT,
@@ -429,7 +489,12 @@ final class PocketController implements SensorEventListener {
                 try {
                     wm.addView(view, p);
                     overlay = view;
+                    overlayShownElapsed = SystemClock.elapsedRealtime();
                     testWindow = test;
+                    main.removeCallbacks(sensorRecheck);
+                    if (!test && near) {
+                        main.postDelayed(sensorRecheck, SENSOR_RECHECK_MS);
+                    }
                     main.removeCallbacks(safety);
                     if (test) {
                         main.postDelayed(safety, TEST_MS);
@@ -458,6 +523,7 @@ final class PocketController implements SensorEventListener {
         main.removeCallbacks(showRunnable);
         main.removeCallbacks(safety);
         main.removeCallbacks(heartbeat);
+        main.removeCallbacks(sensorRecheck);
         try {
             Settings.Global.putLong(context.getContentResolver(),
                     PocketPowerHook.ACTIVE_HEARTBEAT, 0L);
