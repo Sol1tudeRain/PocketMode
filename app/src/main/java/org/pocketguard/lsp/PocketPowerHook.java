@@ -50,7 +50,6 @@ public final class PocketPowerHook {
     private static Handler keyHandler;
     private static Runnable keyEscape;
     private static long keyDownAt;
-    private static volatile boolean consumeVeryLongUntilKeyUp;
     private static ContentObserver challengeObserver;
     private static volatile Context systemContext;
     private static long lastAcknowledgedChallenge;
@@ -152,18 +151,8 @@ public final class PocketPowerHook {
                             cancelHold();
                         }
                     });
-            XposedBridge.hookAllMethods(policy, "powerVeryLongPress",
-                    new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam p) {
-                            if (!held && !consumeVeryLongUntilKeyUp) return;
-                            try {
-                                XposedHelpers.setBooleanField(p.thisObject, "mPowerKeyHandled", true);
-                                p.setResult(null);
-                            } catch (Throwable t) {
-                                Log.w(TAG, "Could not defer very-long software action", t);
-                            }
-                        }
-                    });
+            // Deliberately leave powerVeryLongPress and hardware emergency
+            // combinations unmodified. The 3-second exit happens earlier.
             escapeHooksInstalled = !down.isEmpty() && !up.isEmpty();
             if (!wakeHookOk) {
                 Log.w(TAG, "No pre-wake gate found; pre-attached overlay can still prevent flash");
@@ -365,7 +354,6 @@ public final class PocketPowerHook {
                 Context c = heldContext;
                 if (c == null || !requestExit(c)) return;
                 completed = true;
-                consumeVeryLongUntilKeyUp = true;
                 try {
                     ContentResolver r = c.getContentResolver();
                     int boot = Settings.Global.getInt(r, BOOT_COUNT, -1);
@@ -390,7 +378,6 @@ public final class PocketPowerHook {
     private static synchronized void cancelHold() {
         held = false;
         completed = false;
-        consumeVeryLongUntilKeyUp = false;
         if (keyHandler != null && keyEscape != null) keyHandler.removeCallbacks(keyEscape);
         keyEscape = null;
         heldContext = null;
