@@ -15,11 +15,12 @@ Paranoid Android:
   `CrPocketController.java` likewise separates sensor delivery from
   the window UI thread and requests proximity events at 400,000 µs.
 - `services/core/java/com/android/server/policy/pocket/PocketLock.java`
-  adds a `TYPE_SECURE_SYSTEM_OVERLAY` window with
-  `FLAG_WATCH_OUTSIDE_TOUCH`, `FLAG_SHOW_WHEN_LOCKED`,
-  `FLAG_HARDWARE_ACCELERATED`, `FLAG_FULLSCREEN`, and
-  `FLAG_LAYOUT_IN_SCREEN`. Our overlay uses the same window type and flags
-  **inside system_server**, rather than a different SystemUI window layer.
+  uses `TYPE_SECURE_SYSTEM_OVERLAY`, but Android 17
+  `DisplayPolicy.adjustWindowParamsLw` **forcibly makes that type
+  `FLAG_NOT_TOUCHABLE`**. Therefore this LSPosed port deliberately uses
+  privileged, touchable `TYPE_SYSTEM_ERROR` with full-screen layout to
+  achieve the requested touch interception. This is a necessary deviation
+  from crDroid's view code.
 - `PhoneWindowManager.java` handles pocket visibility and long POWER.
   The new `PocketPowerHook.java` handles POWER inside the same process as
   the overlay, without any `Settings.Global` handshake or heartbeat.
@@ -50,10 +51,16 @@ Debug logs: `logcat -d -s PocketModeCr:V PocketModePower:V | tail -n 80`.
 - This module is not a patch to the ROM's full `android.pocket` framework:
   PixelOS has no crDroid-specific `PocketService`, manager APIs or internal
   `pocket_lock_view` resource. It is an LSPosed port of the relevant logic.
+- The original test version mistakenly stopped monitoring proximity on
+  SCREEN_OFF. Fixed: the controller continues monitoring when screen is off
+  and only shows the overlay while interactive. A non-wakeup proximity sensor
+  is rearmed ONCE upon wake to request an up-to-date initial reading.
 - If the `PhoneWindowManager` power hook cannot be installed, the overlay
-  will not activate. If the secure window type is rejected, the module
-  fails open rather than substituting a lower, potentially touch-through
-  overlay.
+  will not activate. If the privileged `TYPE_SYSTEM_ERROR` window type is
+  rejected, the module fails open instead of showing a touch-through overlay.
+- Android 17 framework behavior is verified against crDroid sources, but
+  actual PixelOS system_server compatibility and input delivery still
+  require physical device testing.
 - System emergency hardware key paths are not modified.
 - If boot issues occur, disable the module via LSPosed safe mode / recovery.
 
