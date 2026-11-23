@@ -17,6 +17,7 @@ import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 import java.util.Set;
+import java.lang.reflect.Method;
 
 /**
  * system_server hook: long POWER dismisses the active PocketMode overlay
@@ -51,6 +52,7 @@ public final class PocketPowerHook {
     private static long keyDownAt;
     private static volatile boolean consumeVeryLongUntilKeyUp;
     private static ContentObserver challengeObserver;
+    private static volatile Context systemContext;
     private static long lastAcknowledgedChallenge;
 
     private PocketPowerHook() { }
@@ -99,7 +101,13 @@ public final class PocketPowerHook {
                     }
                     // Overlay is not ready yet. Do NOT wake to the lock screen
                     // while waiting for asynchronous SystemUI window creation.
-                    p.setResult(null);
+                    Class<?> resultType = p.method instanceof Method
+                            ? ((Method)p.method).getReturnType() : Void.TYPE;
+                    // Some OEM policy helpers return boolean rather than void.
+                    // Returning null for boolean would crash unboxing in system_server.
+                    if (resultType == Boolean.TYPE) p.setResult(false);
+                    else if (resultType == Integer.TYPE) p.setResult(0);
+                    else p.setResult(null);
                     deferWakeUntilOverlayReady(context);
                 }
             };
@@ -172,6 +180,7 @@ public final class PocketPowerHook {
                                 Log.e(TAG, "No policy context; handshake unavailable");
                                 return;
                             }
+                            systemContext = context;
                             registerChallengeObserver(context);
                             registerOverlayReadyObserver(context);
                         }
@@ -389,10 +398,10 @@ public final class PocketPowerHook {
 
     private static Context getContext(Object policy) {
         try {
-            return (Context) XposedHelpers.getObjectField(policy, "mContext");
-        } catch (Throwable t) {
-            return null;
-        }
+            Context local = (Context) XposedHelpers.getObjectField(policy, "mContext");
+            if (local != null) return local;
+        } catch (Throwable ignored) { }
+        return systemContext; // WindowWakeUpPolicy sometimes stores no mContext.
     }
 
     private static boolean isOverlayRecentlyActive(Context context) {
