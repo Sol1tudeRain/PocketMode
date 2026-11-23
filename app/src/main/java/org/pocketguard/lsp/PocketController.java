@@ -61,7 +61,6 @@ final class PocketController implements SensorEventListener {
     private boolean wakeListening;
     private boolean fallbackListening;
     private long lastRawSample;
-    private long lastSleepRequest;
     private long lastGuardPublished = Long.MIN_VALUE;
     private final WindowManager wm;
     private final PowerManager pm;
@@ -244,8 +243,10 @@ final class PocketController implements SensorEventListener {
                 @Override public void onReceive(Context c, Intent i) {
                     String action = i.getAction();
                     if (Intent.ACTION_SCREEN_OFF.equals(action)) {
-                        if (!testWindow) hide();
+                        // Keep the already-added overlay in the WindowManager
+                        // so the next physical POWER wake draws it immediately.
                         syncDisplayState();
+                        if (near && !bypass) schedule();
                         main.postDelayed(PocketController.this::syncDisplayState, 100);
                     } else if (Intent.ACTION_USER_UNLOCKED.equals(action)) {
                         refreshConfig();
@@ -400,11 +401,12 @@ final class PocketController implements SensorEventListener {
         displayState = state;
         Log.i(TAG, "DISPLAY=" + state);
         updateSensors();
-        if (state == Display.STATE_OFF || state == Display.STATE_DOZE
-                || state == Display.STATE_DOZE_SUSPEND) {
-            if (!testWindow) hide();
-        } else if (state == Display.STATE_ON && near && !bypass) {
+        if (near && !bypass) {
+            // A preattached overlay does NOT itself turn on the panel.
+            // Without this, SystemUI adds it after wake and lockscreen flashes.
             schedule();
+        } else if (!testWindow) {
+            hide();
         }
     }
 
@@ -448,9 +450,9 @@ final class PocketController implements SensorEventListener {
             int boot = Settings.Global.getInt(context.getContentResolver(), BOOT_COUNT, -1);
             if (boot < 0) return;
             // A missing live power hook MUST NOT cause a persistent black screen.
-            boolean armed = enabled && near && !bypass
-                    && verifiedPowerChallenge != 0
-                    && verifiedPowerChallenge == pendingPowerChallenge;
+            // Do not wait for the asynchronous challenge response before
+            // publishing NEAR. system_server itself checks its hook readiness.
+            boolean armed = enabled && near && !bypass;
             long encoded = ((long)boot << 1) | (armed ? 1L : 0L);
             if (encoded == lastGuardPublished) return;
             if (Settings.Global.putLong(context.getContentResolver(),
@@ -460,22 +462,6 @@ final class PocketController implements SensorEventListener {
             }
         } catch (Throwable t) {
             Log.w(TAG, "Cannot publish pocket wake guard; fail open", t);
-        }
-    }
-
-    /** Keep display dark; show the overlay only if ROM denies sleep. */
-    private boolean requestSleep() {
-        if (pm == null || !pm.isInteractive()) return true;
-        long now = SystemClock.uptimeMillis();
-        if (now - lastSleepRequest < 1200) return true;
-        lastSleepRequest = now;
-        try {
-            XposedHelpers.callMethod(pm, "goToSleep", now);
-            Log.i(TAG, "Near: requested screen sleep rather than opening pocket overlay");
-            return true;
-        } catch (Throwable t) {
-            Log.w(TAG, "PowerManager.goToSleep unavailable; overlay fallback", t);
-            return false;
         }
     }
 
@@ -508,9 +494,9 @@ final class PocketController implements SensorEventListener {
                 near = true;
                 Log.i(TAG, "Proximity NEAR via " +
                         (authoritativeRaw ? "RAW" : "wakeup/fallback"));
-                // Challenge-response proves system_server can release POWER.
-                if (verifiedPowerChallenge == 0) powerEscapeReady();
+                // Gate POWER wake immediately; handshake creates overlay safely.
                 publishNearGuard();
+                powerEscapeReady();
                 schedule();
             }
         } else if (near && farCandidateAt == 0) {
@@ -532,10 +518,12 @@ final class PocketController implements SensorEventListener {
 
     private void maybeShow() {
         if (!enabled || !near || bypass || overlay != null) return;
-        if (pm == null || !pm.isInteractive()) return;
+        // Pre-arm while the panel is OFF. The overlay has no TURN_SCREEN_ON
+        // or KEEP_SCREEN_ON flags, so it remains invisible until the user
+        // explicitly presses POWER. Its first visible frame is the pocket UI.
         if (!powerEscapeReady()) return;
         publishNearGuard();
-        if (!requestSleep()) showOverlay(false);
+        showOverlay(false);
     }
 
     private void showOverlay(boolean test) {
