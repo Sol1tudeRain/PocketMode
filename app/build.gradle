@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 32
-        versionCode 4
-        versionName '0.4-settings-whitelist'
+        versionCode 5
+        versionName '0.5-power-exit-no-timeout-reset'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
