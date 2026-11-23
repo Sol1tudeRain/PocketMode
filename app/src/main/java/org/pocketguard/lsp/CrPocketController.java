@@ -166,6 +166,10 @@ final class CrPocketController {
                 // A fresh FAR sample also releases the long-POWER override if
                 // registration reset the previous near state on wake.
                 if (!covered) overrideUntilFar = false;
+                Log.i(TAG, "Proximity sample distance=" + distance
+                        + " max=" + proximity.getMaximumRange()
+                        + " covered=" + covered
+                        + " generation=" + sourceGeneration);
                 if (covered == near) return;
                 near = covered;
                 Log.i(TAG, "Proximity " + (covered ? "NEAR" : "FAR")
@@ -221,22 +225,9 @@ final class CrPocketController {
             systemContext.registerReceiver(new BroadcastReceiver() {
                 @Override public void onReceive(Context context, Intent intent) {
                     if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
-                        interactive = false;
-                        main.removeCallbacks(showIfStillNear);
-                        // Dismiss and dispose native input monitoring first,
-                        // then fully unregister proximity to save standby power.
-                        hideOverlay();
-                        unregisterSensor(true);
-                        Log.i(TAG, "SCREEN_OFF: proximity listener stopped");
+                        handleScreenSleep("SCREEN_OFF");
                     } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
-                        interactive = true;
-                        if (!enabled) return;
-                        // A screen wake caused by touch, POWER or a notification
-                        // that actually wakes the display requests a fresh
-                        // proximity sample. A silent FCM push does not.
-                        unregisterSensor(true);
-                        registerSensor();
-                        Log.i(TAG, "SCREEN_ON: requested fresh proximity reading");
+                        handleScreenAwake("SCREEN_ON");
                     }
                 }
             }, screenFilter, null, main, Context.RECEIVER_NOT_EXPORTED);
@@ -251,6 +242,48 @@ final class CrPocketController {
         main.postDelayed(this::refreshEnabled, 15000);
         Log.i(TAG, "Framework pocket controller ready, on-demand sensor="
                 + proximity.getName() + ", wakeup=" + proximity.isWakeUpSensor());
+    }
+
+    /**
+     * Called by PhoneWindowManager.startedWakingUp(), earlier than the
+     * SCREEN_ON broadcast. This is essential when the screen is waking under
+     * a covered proximity sensor: display/UI must not wait for the broadcast.
+     */
+    void onFrameworkWakingUp() {
+        Handler h = main;
+        if (h != null) h.post(() -> handleScreenAwake("startedWakingUp"));
+    }
+
+    void onFrameworkGoingToSleep() {
+        Handler h = main;
+        if (h != null) h.post(() -> handleScreenSleep("startedGoingToSleep"));
+    }
+
+    private void handleScreenAwake(String reason) {
+        boolean wasInteractive = interactive;
+        interactive = true;
+        if (!enabled) {
+            Log.i(TAG, reason + ": PocketMode switch OFF");
+            return;
+        }
+        if (!wasInteractive) {
+            // Wake transition is the only point where we must reset the
+            // previous cycle's state and ask for an initial new sample.
+            unregisterSensor(true);
+        }
+        if (!listening) registerSensor();
+        Log.i(TAG, reason + ": sensorListening=" + listening
+                + " near=" + near + " wasInteractive=" + wasInteractive);
+        if (near && !overrideUntilFar) scheduleShow();
+    }
+
+    private void handleScreenSleep(String reason) {
+        if (!interactive && !listening && overlay == null) return;
+        interactive = false;
+        main.removeCallbacks(showIfStillNear);
+        hideOverlay();
+        unregisterSensor(true);
+        Log.i(TAG, reason + ": sensor stopped, protection idle");
     }
 
     private void refreshEnabled() {
@@ -290,10 +323,16 @@ final class CrPocketController {
         // A DOZE/AOD pulse that does not wake the screen does not trigger
         // a full sensor registration in this version.
         ++sensorGeneration;
-        boolean ok = sensorManager.registerListener(proximityListener,
-                proximity, PROXIMITY_RATE_US, sensorHandler);
-        listening = ok;
-        if (!ok) Log.e(TAG, "Cannot register proximity listener on wake");
+        try {
+            listening = sensorManager.registerListener(proximityListener,
+                    proximity, PROXIMITY_RATE_US, sensorHandler);
+            Log.i(TAG, "register proximity listener: " + listening
+                    + ", sensor=" + proximity.getName()
+                    + ", generation=" + sensorGeneration);
+        } catch (Throwable t) {
+            listening = false;
+            Log.e(TAG, "Cannot register proximity sensor after screen wake", t);
+        }
     }
 
     private void unregisterSensor() {
@@ -304,7 +343,11 @@ final class CrPocketController {
         ++sensorGeneration; // invalidate callbacks queued from prior sessions
         if (listening && sensorManager != null) {
             listening = false;
-            sensorManager.unregisterListener(proximityListener);
+            try {
+                sensorManager.unregisterListener(proximityListener);
+            } catch (Throwable t) {
+                Log.e(TAG, "Proximity unregister failed", t);
+            }
         }
         lastSensorTimestampNanos = 0;
         main.removeCallbacks(showIfStillNear);
