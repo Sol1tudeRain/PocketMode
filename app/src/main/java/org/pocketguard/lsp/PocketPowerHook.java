@@ -33,9 +33,16 @@ public final class PocketPowerHook {
     private static final long MAX_HEARTBEAT_AGE_MS = 12500L;
     /** Shared near flag, encoded with Settings.Global boot_count to reject stale boots. */
     static final String PROX_GUARD = "pocketmode_proximity_guard_boot";
+    static final String WAKE_REQUEST = "pocketmode_power_prearm_request";
+    private static final long PREARM_TIMEOUT_MS = 700L;
     static final long POWER_EXIT_HOLD_MS = 3000L;
     private static final String BOOT_COUNT = "boot_count";
     private static volatile boolean escapeHooksInstalled;
+    private static volatile boolean wakeDeferred;
+    private static Handler wakeHandler;
+    private static Runnable wakeTimeout;
+    private static Context deferredContext;
+    private static ContentObserver overlayReadyObserver;
     private static volatile boolean held;
     private static volatile boolean completed;
     private static Context heldContext;
@@ -79,27 +86,46 @@ public final class PocketPowerHook {
             // rather than canceling the entire power-key input path.
             XC_MethodHook gate = new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    // This callback only handles explicit hardware POWER wake.
                     if (!isPowerWake(p.args)) return;
                     Context context = getContext(p.thisObject);
                     if (context == null || !isProximityGuarded(context)) return;
-                    PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-                    if (pm == null || pm.isInteractive()) return;
-                    if (completed) return;
-                    // Calling wakeUpFromWakeKey would light the display BEFORE
-                    // SystemUI could show a pocket overlay. Skip only that wake call.
+                    PowerManager pm = (PowerManager)
+                            context.getSystemService(Context.POWER_SERVICE);
+                    if (pm == null || pm.isInteractive() || completed) return;
+                    if (isOverlayRecentlyActive(context)) {
+                        Log.i(TAG, "POWER: pocket window already pre-armed; wake normally");
+                        return; // The first visible frame will be the pocket UI.
+                    }
+                    // Overlay is not ready yet. Do NOT wake to the lock screen
+                    // while waiting for asynchronous SystemUI window creation.
                     p.setResult(null);
-                    Log.i(TAG, "Blocked POWER wake before display turn-on");
+                    deferWakeUntilOverlayReady(context);
                 }
             };
             boolean wakeHookOk = false;
             for (String name : new String[]{"wakeUpFromWakeKey", "wakeUpFromPowerKey"}) {
                 try {
-                    Set<XC_MethodHook.Unhook> s = XposedBridge.hookAllMethods(policy, name, gate);
+                    Set<XC_MethodHook.Unhook> s =
+                            XposedBridge.hookAllMethods(policy, name, gate);
                     wakeHookOk |= !s.isEmpty();
-                    if (!s.isEmpty()) Log.i(TAG, "Pre-wake hook installed: " + name);
+                    if (!s.isEmpty()) Log.i(TAG, "POWER wake gate: " + name);
                 } catch (Throwable t) {
-                    Log.w(TAG, "No pre-wake method " + name, t);
+                    Log.w(TAG, "No policy POWER wake method " + name, t);
                 }
+            }
+            // AOSP 16+ delegates to WindowWakeUpPolicy on many ROMs.
+            try {
+                Class<?> wakePolicy = XposedHelpers.findClassIfExists(
+                        "com.android.server.policy.WindowWakeUpPolicy", lp.classLoader);
+                if (wakePolicy != null) {
+                    Set<XC_MethodHook.Unhook> s = XposedBridge.hookAllMethods(
+                            wakePolicy, "wakeUpFromPowerKey", gate);
+                    wakeHookOk |= !s.isEmpty();
+                    if (!s.isEmpty()) Log.i(TAG, "POWER wake gate: WindowWakeUpPolicy");
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "No WindowWakeUpPolicy POWER wake gate", t);
             }
             Set<XC_MethodHook.Unhook> down = XposedBridge.hookAllMethods(
                     policy, "interceptPowerKeyDown", new XC_MethodHook() {
@@ -130,7 +156,10 @@ public final class PocketPowerHook {
                             }
                         }
                     });
-            escapeHooksInstalled = wakeHookOk && !down.isEmpty() && !up.isEmpty();
+            escapeHooksInstalled = !down.isEmpty() && !up.isEmpty();
+            if (!wakeHookOk) {
+                Log.w(TAG, "No pre-wake gate found; pre-attached overlay can still prevent flash");
+            }
             if (!escapeHooksInstalled) {
                 Log.e(TAG, "Incomplete wake/hold hooks; protection handshake disabled");
                 return;
@@ -144,6 +173,7 @@ public final class PocketPowerHook {
                                 return;
                             }
                             registerChallengeObserver(context);
+                            registerOverlayReadyObserver(context);
                         }
                     });
             Log.i(TAG, "PhoneWindowManager POWER interception installed");
@@ -221,8 +251,79 @@ public final class PocketPowerHook {
             return ((Integer) args[1]) == KeyEvent.KEYCODE_POWER
                     && ((Boolean) args[2]);
         }
-        // Older wakeUpFromPowerKey(long eventTime).
+        // wakeUpFromPowerKey(long eventTime) in older PhoneWindowManager
+        // or modern WindowWakeUpPolicy; this method ONLY handles POWER.
         return args.length == 1 && args[0] instanceof Long;
+    }
+
+    /**
+     * Wait for the SystemUI surface to exist before waking the panel.
+     * Fail open after 700ms if SystemUI/LSPosed is unhealthy.
+     */
+    private static synchronized void deferWakeUntilOverlayReady(Context c) {
+        if (wakeDeferred) return;
+        wakeDeferred = true;
+        deferredContext = c;
+        if (wakeHandler == null) wakeHandler = new Handler(Looper.getMainLooper());
+        try {
+            Settings.Global.putLong(c.getContentResolver(), WAKE_REQUEST,
+                    SystemClock.elapsedRealtime());
+        } catch (Throwable t) {
+            Log.w(TAG, "Cannot request SystemUI pre-arm", t);
+        }
+        wakeTimeout = () -> finishDeferredWake("fail-open timeout");
+        wakeHandler.postDelayed(wakeTimeout, PREARM_TIMEOUT_MS);
+        Log.i(TAG, "POWER: waiting up to 700ms for pocket window");
+    }
+
+    private static synchronized void finishDeferredWake(String reason) {
+        if (!wakeDeferred) return;
+        Context c = deferredContext;
+        wakeDeferred = false;
+        deferredContext = null;
+        if (wakeHandler != null && wakeTimeout != null)
+            wakeHandler.removeCallbacks(wakeTimeout);
+        wakeTimeout = null;
+        if (c == null || completed) return;
+        Log.i(TAG, "POWER: display wake " + reason);
+        wakeDisplay(c);
+    }
+
+    private static void wakeDisplay(Context c) {
+        try {
+            PowerManager p = (PowerManager)
+                    c.getSystemService(Context.POWER_SERVICE);
+            if (p == null || p.isInteractive()) return;
+            long now = SystemClock.uptimeMillis();
+            try {
+                XposedHelpers.callMethod(p, "wakeUp", now, 1,
+                        "PocketMode:physical-power");
+            } catch (Throwable newer) {
+                XposedHelpers.callMethod(p, "wakeUp", now);
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Cannot resume deferred wake; next power press can retry", t);
+        }
+    }
+
+    private static synchronized void registerOverlayReadyObserver(Context c) {
+        if (overlayReadyObserver != null) return;
+        if (wakeHandler == null) wakeHandler = new Handler(Looper.getMainLooper());
+        try {
+            overlayReadyObserver = new ContentObserver(wakeHandler) {
+                @Override public void onChange(boolean selfChange) {
+                    if (wakeDeferred && isOverlayRecentlyActive(c))
+                        finishDeferredWake("pocket overlay ready");
+                }
+            };
+            c.getContentResolver().registerContentObserver(
+                    Settings.Global.getUriFor(ACTIVE_HEARTBEAT), false,
+                    overlayReadyObserver);
+            Log.i(TAG, "POWER wake waits for SystemUI pocket surface readiness");
+        } catch (Throwable t) {
+            overlayReadyObserver = null;
+            Log.w(TAG, "Overlay readiness observer unavailable; timeout fallback", t);
+        }
     }
 
     private static boolean isProximityGuarded(Context context) {
@@ -261,19 +362,13 @@ public final class PocketPowerHook {
                     int boot = Settings.Global.getInt(r, BOOT_COUNT, -1);
                     if (boot >= 0) Settings.Global.putLong(r, PROX_GUARD, (long) boot << 1);
                 } catch (Throwable t) { Log.w(TAG, "Cannot clear wake guard", t); }
-                PowerManager power = (PowerManager)c.getSystemService(Context.POWER_SERVICE);
-                if (power != null && !power.isInteractive()) {
-                    long now = SystemClock.uptimeMillis();
-                    try {
-                        XposedHelpers.callMethod(power, "wakeUp", now, 1,
-                                "PocketMode:3s-power-escape");
-                    } catch (Throwable first) {
-                        try { XposedHelpers.callMethod(power, "wakeUp", now); }
-                        catch (Throwable second) {
-                            Log.e(TAG, "3s exit sent; automatic display wake unavailable", second);
-                        }
-                    }
+                if (wakeDeferred) {
+                    wakeDeferred = false;
+                    if (wakeHandler != null && wakeTimeout != null)
+                        wakeHandler.removeCallbacks(wakeTimeout);
+                    deferredContext = null;
                 }
+                wakeDisplay(c);
                 Log.i(TAG, "Physical POWER held >=3s: bypass pocket until FAR");
             }
         };
