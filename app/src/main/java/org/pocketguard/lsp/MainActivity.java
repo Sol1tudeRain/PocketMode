@@ -8,6 +8,8 @@ import android.content.pm.ResolveInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Bundle;
+import android.os.Build;
+import android.view.WindowInsets;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.view.Gravity;
@@ -79,6 +81,17 @@ public final class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG);
         root.setPadding(dp(20), dp(22), dp(20), dp(12));
+        // Target SDK 35 applies edge-to-edge on modern Android. Keep the
+        // settings switch and whitelist out of status/navigation bar regions.
+        if (Build.VERSION.SDK_INT >= 30) {
+            root.setOnApplyWindowInsetsListener((view, insets) -> {
+                android.graphics.Insets bars = insets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                view.setPadding(dp(20) + bars.left, dp(22) + bars.top,
+                        dp(20) + bars.right, dp(12) + bars.bottom);
+                return insets;
+            });
+        }
         setContentView(root);
 
         TextView heading = text("口袋模式", 27, TEXT, true);
@@ -160,7 +173,7 @@ public final class MainActivity extends Activity {
         listLp.topMargin = dp(6);
         root.addView(list, listLp);
 
-        TextView footer = text("LSPosed 作用域：系统界面 (com.android.systemui)。首次安装或升级后重启手机。", 11, MUTED, false);
+        TextView footer = text("LSPosed 作用域：系统界面 (com.android.systemui) + 系统框架 (android)。升级后重启手机。", 11, MUTED, false);
         footer.setPadding(0, dp(9), 0, dp(4));
         root.addView(footer);
     }
