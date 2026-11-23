@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">PocketMode</string>
+    <string name="pocket_mode_title">口袋检测已开启</string>
+    <string name="pocket_mode_illustration_description">蓝色区域标示距离传感器</string>
+    <string name="pocket_mode_instructions_header">如需使用您的手机：</string>
+    <string name="pocket_mode_instruction_step1">1. 确保蓝色区域（距离传感器）不受遮挡。</string>
+    <string name="pocket_mode_instruction_step2">2. 移开遮挡即可退出；误判时 15 秒自动解除。</string>
+    <string-array name="xposed_scope"><item>com.android.systemui</item></string-array>
+</resources>
