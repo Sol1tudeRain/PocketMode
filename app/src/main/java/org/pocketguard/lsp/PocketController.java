@@ -1,6 +1,5 @@
 package org.pocketguard.lsp;
 
-import android.app.KeyguardManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -37,7 +36,6 @@ final class PocketController implements SensorEventListener {
     private final SensorManager sm;
     private final Sensor prox;
     private final WindowManager wm;
-    private final KeyguardManager km;
     private final PowerManager pm;
 
     private boolean enabled;
@@ -64,7 +62,6 @@ final class PocketController implements SensorEventListener {
         sm = (SensorManager) ctx.getSystemService(Context.SENSOR_SERVICE);
         prox = sm == null ? null : sm.getDefaultSensor(Sensor.TYPE_PROXIMITY);
         wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
-        km = (KeyguardManager) ctx.getSystemService(Context.KEYGUARD_SERVICE);
         pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
     }
 
@@ -90,9 +87,11 @@ final class PocketController implements SensorEventListener {
             context.registerReceiver(new BroadcastReceiver() {
                 @Override public void onReceive(Context c, Intent i) {
                     String action = i.getAction();
-                    if (Intent.ACTION_SCREEN_ON.equals(action)) schedule();
-                    else if (Intent.ACTION_SCREEN_OFF.equals(action)
+                    if (Intent.ACTION_SCREEN_ON.equals(action)
                             || Intent.ACTION_USER_PRESENT.equals(action)) {
+                        // Unlocking does not dismiss pocket mode; re-check if near.
+                        schedule();
+                    } else if (Intent.ACTION_SCREEN_OFF.equals(action)) {
                         if (!testWindow) hide();
                     }
                 }
@@ -162,14 +161,12 @@ final class PocketController implements SensorEventListener {
 
     private void maybeShow() {
         if (!enabled || !near || bypass || overlay != null) return;
-        if (wm == null || km == null || pm == null) return;
-        boolean interactive = pm.isInteractive();
-        boolean locked = km.isKeyguardLocked();
-        if (!interactive || !locked) {
-            Log.i(TAG, "Pocket sensed, overlay not shown: interactive=" + interactive +
-                    " keyguardLocked=" + locked + " (lock screen only)");
+        if (wm == null || pm == null) return;
+        if (!pm.isInteractive()) {
+            Log.i(TAG, "Pocket sensed, overlay deferred: screen not interactive");
             return;
         }
+        // Pocket protection is active on both lockscreen and unlocked apps.
         showOverlay(false);
     }
 
