@@ -1,34 +1,28 @@
 /*
- * CrPocketController adapts the service/controller separation used by
- * crDroid / Paranoid Android PocketService and PocketLock (Apache-2.0).
- * Source inspiration:
- * https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
+ * PocketMode for Android 17 / PixelOS.
  *
- * Unlike the ROM's native implementation, this is injected by LSPosed into
- * system_server and uses the module's own view resources. No framework
- * resource IDs or android.pocket classes are assumed to exist on PixelOS.
+ * One trigger: physical display state. ON and Doze/AOD mean check proximity;
+ * OFF means stop proximity. No power-key wake heuristics, broadcast timing,
+ * cached NEAR, notification intercept, or repeated sensor re-registration.
  */
 package org.pocketguard.lsp;
 
-import android.content.BroadcastReceiver;
 import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
 import android.database.ContentObserver;
 import android.graphics.PixelFormat;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
+import android.hardware.display.DisplayManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.Looper;
 import android.os.PowerManager;
-import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
@@ -38,218 +32,81 @@ import android.widget.FrameLayout;
 
 import de.robv.android.xposed.XposedHelpers;
 
-/**
- * System policy-owned pocket protector. The sensor listener does not share the
- * UI thread, so a busy UI thread will not delay sensor sampling. UI changes
- * are serialized on the main looper. One overlay, one owner, no cross-process
- * power-key heartbeat, no 700-ms foreground-app polling.
- */
 final class CrPocketController {
     private static final String TAG = "PocketModeCr";
     private static final Uri SETTINGS_URI =
             Uri.parse("content://org.pocketguard.lsp.config/settings");
-    private static final long NEAR_CONFIRM_MS = 120;
-    private static final long STALE_SENSOR_PROBE_MS = 6500;
-    // This device reported NEAR=0 before sleep but false FAR=5 during
-    // the entire next wake despite continuous physical cover. We must
-    // not trust the first wake samples or latch a false NEAR forever.
-    private static final long WAKE_RECHECK_MS = 900;
-    private static final long WAKE_VALIDATION_MS = 3400;
-    private static final int PROXIMITY_RATE_US = 400000; // crDroid PocketService
-    // AOSP/CrDroid 17 DisplayPolicy.adjustWindowParamsLw forcibly applies
-    // FLAG_NOT_TOUCHABLE to TYPE_SECURE_SYSTEM_OVERLAY. Thus the original
-    // crDroid PocketLock visual layer cannot consume touch input on this ROM.
-    // TYPE_SYSTEM_ERROR is a privileged *touchable* layer above the nav bar.
+    private static final long NEAR_CONFIRM_MS = 120L;
+    private static final int PROXIMITY_RATE_US = 400000;
     private static final int TYPE_SYSTEM_ERROR = 2010;
     private static final int DISABLE_USER_ACTIVITY_INPUT = 2;
     private static final int DISABLE_EXPAND = 0x00010000;
     private static final int DISABLE2_QS_AND_SHADE = 0x5;
 
     private final Context systemContext;
-    // Do not dispatch sensor/UI updates on system_server's main looper. A
-    // navigation transition can stall that thread and leave a pocket view
-    // visible long after the distance sensor has reported FAR.
-    private final HandlerThread uiThread = new HandlerThread("PocketModeWindowUi");
-    private Handler main;
     private final SensorManager sensorManager;
-    private final PowerManager powerManager;
+    private final DisplayManager displayManager;
     private final WindowManager windowManager;
     private final Sensor proximity;
-    private final HandlerThread sensorThread = new HandlerThread("PocketModeSensors");
+    private final HandlerThread windowThread = new HandlerThread("PocketModeUi");
+    private final HandlerThread sensorThread = new HandlerThread("PocketModeSensor");
+    private Handler main;
     private Handler sensorHandler;
     private PocketInputShield inputShield;
-    private int inputStartGeneration;
-    private boolean inputPreparing;
-    private long lastSensorReadingElapsed;
-    private boolean staleProbeAttempted;
     private boolean enabled;
-    private boolean listening;
-    // Sensor callbacks are delivered on the sensor thread, while all
-    // lifecycle changes are serialized through the window UI handler.
-    private volatile int sensorGeneration;
+    private boolean displayLit;
+    private int displayState = Display.STATE_UNKNOWN;
+    private volatile boolean listening;
+    private volatile int sensorEpoch;
     private boolean near;
-    private boolean coveredBeforeSleep;
-    private boolean validatingWakeCover;
-    private boolean wakeNearConfirmed;
-    private int wakeFarSamples;
-    private volatile boolean overrideUntilFar;
-    private boolean interactive;
     private volatile boolean overlayShowing;
+    private volatile boolean bypassUntilFar;
+    private boolean preparing;
+    private int preparationEpoch;
     private View overlay;
     private Object statusBarManager;
-    private boolean statusBarRestricted;
-    private long lastSensorTimestampNanos;
-
-    private void resetWakeValidation() {
-        if (main != null) {
-            main.removeCallbacks(wakeRecheck);
-            main.removeCallbacks(wakeValidationDeadline);
-        }
-        validatingWakeCover = false;
-        wakeNearConfirmed = false;
-        wakeFarSamples = 0;
-    }
-
-    private final Runnable wakeRecheck = () -> {
-        if (!validatingWakeCover || !interactive || !enabled || !listening)
-            return;
-        Log.i(TAG, "Wake recheck: re-register proximity; FAR samples="
-                + wakeFarSamples);
-        unregisterSensor(false); // retain temporary NEAR until verified
-        registerSensor();
-    };
-
-    private final Runnable wakeValidationDeadline = () -> {
-        if (!validatingWakeCover) return;
-        validatingWakeCover = false;
-        coveredBeforeSleep = false;
-        if (!wakeNearConfirmed && wakeFarSamples > 0) {
-            // The sensor only reports FAR after wake. Do not trap the user
-            // behind the overlay permanently; fail open after bounded grace.
-            Log.w(TAG, "Wake-cover validation expired: all FAR samples ("
-                    + wakeFarSamples + "), dismissing unverified cover");
-            near = false;
-            cancelPendingShow();
-            hideOverlay();
-        } else {
-            Log.i(TAG, "Wake-cover validation retained: nearConfirmed="
-                    + wakeNearConfirmed + ", farSamples=" + wakeFarSamples);
-        }
-        wakeFarSamples = 0;
-    };
-
-    private final Runnable staleSensorProbe = () -> {
-        if (!enabled || !interactive || !listening || !near
-                || !overlayShowing || staleProbeAttempted) return;
-        long idle = SystemClock.elapsedRealtime() - lastSensorReadingElapsed;
-        if (idle >= STALE_SENSOR_PROBE_MS) {
-            staleProbeAttempted = true;
-            Log.w(TAG, "Proximity FAR not received for " + idle
-                    + "ms; requesting a single fresh HAL sample");
-            // Preserve NEAR here. Clearing it would make the subsequent FAR
-            // event look unchanged and leave a displayed overlay stuck.
-            unregisterSensor(false);
-            registerSensor();
-            if (!listening) {
-                overrideUntilFar = true;
-                hideOverlay();
-            }
-        }
-    };
-
-    private void disableShadeWhileBlocked() {
-        try {
-            if (statusBarManager == null)
-                statusBarManager = systemContext.getSystemService("statusbar");
-            if (statusBarManager == null) {
-                Log.w(TAG, "StatusBarManager unavailable; overlay still intercepts touches");
-                return;
-            }
-            XposedHelpers.callMethod(statusBarManager, "disable", DISABLE_EXPAND);
-            XposedHelpers.callMethod(statusBarManager, "disable2",
-                    DISABLE2_QS_AND_SHADE);
-            statusBarRestricted = true;
-        } catch (Throwable t) {
-            Log.w(TAG, "Could not disable shade; relying on input window", t);
-            restoreSystemBars();
-        }
-    }
-
-    private void restoreSystemBars() {
-        if (statusBarManager == null) return;
-        try {
-            XposedHelpers.callMethod(statusBarManager, "disable", 0);
-            XposedHelpers.callMethod(statusBarManager, "disable2", 0);
-            statusBarRestricted = false;
-        } catch (Throwable t) {
-            Log.e(TAG, "Could not restore status bar state", t);
-        }
-    }
 
     private final Runnable showIfStillNear = () -> {
-        if (enabled && interactive && near && !overrideUntilFar
+        if (enabled && displayLit && near && !bypassUntilFar
                 && PocketPowerHook.isEscapeInstalled()) {
-            showOverlay();
+            requestOverlay();
         }
     };
 
-    private void cancelPendingShow() {
-        if (main != null) main.removeCallbacks(showIfStillNear);
-    }
-
-    private final SensorEventListener proximityListener = new SensorEventListener() {
-        @Override public void onSensorChanged(SensorEvent event) {
-            if (event.sensor.getType() != Sensor.TYPE_PROXIMITY || event.values == null
-                    || event.values.length == 0) return;
-            final boolean covered = event.values[0] < proximity.getMaximumRange();
-            final long now = SystemClock.elapsedRealtime();
-            final float distance = event.values[0];
-            final long eventTimestamp = event.timestamp;
-            final int sourceGeneration = sensorGeneration;
-            main.post(() -> {
-                // Do not read sensors while the display is off. In-flight
-                // events from the previous registration are also discarded.
-                if (!enabled || !interactive || !listening
-                        || sourceGeneration != sensorGeneration) return;
-                if (eventTimestamp > 0 && lastSensorTimestampNanos > eventTimestamp)
-                    return;
-                lastSensorTimestampNanos = eventTimestamp;
-                lastSensorReadingElapsed = SystemClock.elapsedRealtime();
-                // During the first seconds after waking up while previously
-                // covered, the Xiaomi wake-up HAL has been observed to emit
-                // false FAR. Ask for a second registration before trusting it.
-                if (validatingWakeCover) {
-                    if (covered) {
-                        wakeNearConfirmed = true;
-                        validatingWakeCover = false;
-                        coveredBeforeSleep = false;
-                        main.removeCallbacks(wakeRecheck);
-                        main.removeCallbacks(wakeValidationDeadline);
-                        Log.i(TAG, "Wake cover confirmed by fresh NEAR");
-                    } else {
-                        wakeFarSamples++;
-                        Log.w(TAG, "Unverified wake FAR=" + distance
-                                + " sample=" + wakeFarSamples);
-                        return;
-                    }
+    private final DisplayManager.DisplayListener displayListener =
+            new DisplayManager.DisplayListener() {
+                @Override public void onDisplayAdded(int id) {
+                    if (id == Display.DEFAULT_DISPLAY) syncDisplayState();
                 }
-                if (!covered) overrideUntilFar = false;
-                Log.i(TAG, "Proximity sample distance=" + distance
-                        + " max=" + proximity.getMaximumRange()
-                        + " covered=" + covered
-                        + " generation=" + sourceGeneration);
+                @Override public void onDisplayRemoved(int id) {
+                    if (id == Display.DEFAULT_DISPLAY) setDisplayState(Display.STATE_OFF);
+                }
+                @Override public void onDisplayChanged(int id) {
+                    if (id == Display.DEFAULT_DISPLAY) syncDisplayState();
+                }
+            };
+
+    private final SensorEventListener sensorListener = new SensorEventListener() {
+        @Override public void onSensorChanged(SensorEvent event) {
+            if (event.sensor.getType() != Sensor.TYPE_PROXIMITY
+                    || event.values == null || event.values.length == 0) return;
+            final int epoch = sensorEpoch;
+            final float distance = event.values[0];
+            final boolean covered = distance < proximity.getMaximumRange();
+            main.post(() -> {
+                if (!enabled || !displayLit || !listening || epoch != sensorEpoch)
+                    return;
                 if (covered == near) return;
                 near = covered;
-                Log.i(TAG, "Proximity " + (covered ? "NEAR" : "FAR")
-                        + ", distance=" + distance + ", elapsed=" + now);
-                if (covered) {
-                    if (interactive) scheduleShow();
-                } else {
-                    main.removeCallbacks(staleSensorProbe);
-                    staleProbeAttempted = false;
-                    overrideUntilFar = false;
+                Log.i(TAG, "Proximity " + (near ? "NEAR" : "FAR")
+                        + " distance=" + distance + " displayState=" + displayState);
+                if (near) {
                     main.removeCallbacks(showIfStillNear);
-                    hideOverlay(); // FAR removes immediately, no timeout
+                    main.postDelayed(showIfStillNear, NEAR_CONFIRM_MS);
+                } else {
+                    bypassUntilFar = false;
+                    main.removeCallbacks(showIfStillNear);
+                    hideOverlay();
                 }
             });
         }
@@ -259,277 +116,182 @@ final class CrPocketController {
     CrPocketController(Context context) {
         systemContext = context;
         sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
-        powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        displayManager = (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
         windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-        Sensor nonWakeup = sensorManager == null ? null
-                : sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY, false);
-        Sensor defaultProximity = sensorManager == null ? null
-                : sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
-        // We do not listen during screen-off. Prefer the non-wakeup
-        // variant if provided, because this phone's wakeup variant
-        // returned persistent false FAR immediately after screen wake.
-        proximity = nonWakeup != null ? nonWakeup : defaultProximity;
-        Log.i(TAG, "Proximity candidates: default="
-                + (defaultProximity == null ? "none" : defaultProximity.getName())
-                + ", nonWakeup=" + (nonWakeup == null ? "none" : nonWakeup.getName())
-                + ", selected=" + (proximity == null ? "none" : proximity.getName()));
-        interactive = powerManager != null && powerManager.isInteractive();
+        Sensor nonWakeup = sensorManager == null ? null :
+                sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY, false);
+        Sensor standard = sensorManager == null ? null :
+                sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+        proximity = nonWakeup != null ? nonWakeup : standard;
     }
 
     void init() {
-        if (proximity == null || windowManager == null || powerManager == null) {
-            Log.e(TAG, "No proximity sensor / WindowManager / PowerManager, fail open");
+        if (proximity == null || displayManager == null || windowManager == null) {
+            Log.e(TAG, "Missing sensor/display/window service; disabling protection");
             return;
         }
-        uiThread.start();
-        main = new Handler(uiThread.getLooper());
-        inputShield = new PocketInputShield(systemContext, main,
-                () -> overlayShowing);
-        inputShield.init();
+        windowThread.start();
         sensorThread.start();
+        main = new Handler(windowThread.getLooper());
         sensorHandler = new Handler(sensorThread.getLooper());
+        inputShield = new PocketInputShield(systemContext, main, () -> overlayShowing);
+        inputShield.init();
 
         systemContext.getContentResolver().registerContentObserver(
                 SETTINGS_URI, false, new ContentObserver(main) {
                     @Override public void onChange(boolean selfChange) {
-                        refreshEnabled();
+                        readSwitch();
                     }
                 });
+        displayManager.registerDisplayListener(displayListener, main);
+        main.post(() -> {
+            readSwitch();
+            syncDisplayState();
+        });
+        // Retry once after system boot, when the module's provider becomes ready.
+        main.postDelayed(this::readSwitch, 15000);
+        Log.i(TAG, "Simple display-driven controller: sensor=" + proximity.getName());
+    }
 
-        IntentFilter screenFilter = new IntentFilter();
-        screenFilter.addAction(Intent.ACTION_SCREEN_ON);
-        screenFilter.addAction(Intent.ACTION_SCREEN_OFF);
+    private void readSwitch() {
         try {
-            systemContext.registerReceiver(new BroadcastReceiver() {
-                @Override public void onReceive(Context context, Intent intent) {
-                    if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
-                        handleScreenSleep("SCREEN_OFF");
-                    } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
-                        handleScreenAwake("SCREEN_ON");
-                    }
-                }
-            }, screenFilter, null, main, Context.RECEIVER_NOT_EXPORTED);
-        } catch (Throwable e) {
-            Log.e(TAG, "Screen receiver failed; disabling pocket protection", e);
-            return;
-        }
-        main.post(this::refreshEnabled);
-        // During early boot the user's package provider may not be ready yet.
-        // A one-shot post-boot retry keeps first-install default ON without
-        // introducing background polling.
-        main.postDelayed(this::refreshEnabled, 15000);
-        Log.i(TAG, "Framework pocket controller ready, on-demand sensor="
-                + proximity.getName() + ", wakeup=" + proximity.isWakeUpSensor());
-    }
-
-    /**
-     * Called by PhoneWindowManager.startedWakingUp(), earlier than the
-     * SCREEN_ON broadcast. This is essential when the screen is waking under
-     * a covered proximity sensor: display/UI must not wait for the broadcast.
-     */
-    void onFrameworkWakingUp() {
-        Handler h = main;
-        if (h != null) h.post(() -> handleScreenAwake("startedWakingUp"));
-    }
-
-    void onFrameworkGoingToSleep() {
-        Handler h = main;
-        if (h != null) h.post(() -> handleScreenSleep("startedGoingToSleep"));
-    }
-
-    private void handleScreenAwake(String reason) {
-        boolean wasInteractive = interactive;
-        interactive = true;
-        if (!enabled) {
-            Log.i(TAG, reason + ": PocketMode switch OFF");
-            return;
-        }
-        if (!wasInteractive) {
-            resetWakeValidation();
-            unregisterSensor(true);
-            if (coveredBeforeSleep) {
-                // Latch the observed pre-sleep NEAR for a short, bounded
-                // wake grace period. Do not assume first FAR is correct.
-                validatingWakeCover = true;
-                near = true;
-                main.postDelayed(wakeRecheck, WAKE_RECHECK_MS);
-                main.postDelayed(wakeValidationDeadline, WAKE_VALIDATION_MS);
-                Log.i(TAG, "Wake with cached NEAR: verifying fresh sensor"
-                        + " (no sleep-time sensor listening)");
-            }
-        }
-        if (!listening) registerSensor();
-        Log.i(TAG, reason + ": sensorListening=" + listening
-                + " near=" + near + " wasInteractive=" + wasInteractive
-                + " validating=" + validatingWakeCover);
-        if (near && !overrideUntilFar) scheduleShow();
-    }
-
-    private void handleScreenSleep(String reason) {
-        if (!interactive && !listening && overlay == null) return;
-        // Keep the last genuinely observed NEAR as a hint for next wake.
-        // The actual sensor listener is STILL fully unregistered in sleep.
-        coveredBeforeSleep = near || overlayShowing;
-        resetWakeValidation();
-        interactive = false;
-        main.removeCallbacks(showIfStillNear);
-        hideOverlay();
-        unregisterSensor(true);
-        Log.i(TAG, reason + ": sensor stopped, cachedNear="
-                + coveredBeforeSleep);
-    }
-
-    private void refreshEnabled() {
-        Bundle state;
-        try {
-            state = systemContext.getContentResolver()
+            Bundle state = systemContext.getContentResolver()
                     .call(SETTINGS_URI, "get", null, null);
-            if (state == null) throw new IllegalStateException("Null preferences");
+            if (state == null) throw new IllegalStateException("Null settings");
+            boolean requested = state.getBoolean("enabled", true);
+            if (requested == enabled) return;
+            enabled = requested;
+            Log.i(TAG, "Module enabled=" + enabled);
+            applySensorState();
         } catch (Throwable t) {
-            Log.w(TAG, "Preferences provider unavailable; leave protection off", t);
-            enabled = false;
-            unregisterSensor();
-            hideOverlay();
-            return;
+            if (enabled) {
+                enabled = false;
+                applySensorState();
+            }
+            Log.e(TAG, "Settings unavailable: disabled until retry", t);
         }
-        boolean wanted = state.getBoolean("enabled", true);
-        if (wanted == enabled) return;
-        enabled = wanted;
-        if (enabled && interactive) {
-            registerSensor();
-            if (near) scheduleShow();
-        } else {
-            resetWakeValidation();
-            coveredBeforeSleep = false;
-            // Enabled but fully screen-off is deliberately sensor-idle.
-            hideOverlay();
-            unregisterSensor(true);
-        }
-        Log.i(TAG, "PocketMode enabled=" + enabled
-                + " screenInteractive=" + interactive
-                + " sensorListening=" + listening);
     }
 
-    private void registerSensor() {
-        if (!enabled || !interactive || listening
-                || sensorManager == null || sensorHandler == null) return;
-        // Only register while the actual screen is interactive. The initial
-        // value from the on-change proximity sensor gates the overlay.
-        // A DOZE/AOD pulse that does not wake the screen does not trigger
-        // a full sensor registration in this version.
-        ++sensorGeneration;
+    private void syncDisplayState() {
+        Display current = displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+        setDisplayState(current == null ? Display.STATE_OFF : current.getState());
+    }
+
+    private static boolean isLit(int state) {
+        // Doze is AOD. In DOZE_SUSPEND pixels may remain visible while the
+        // panel is driven by a low-power controller.
+        return state == Display.STATE_ON || state == Display.STATE_DOZE
+                || state == Display.STATE_DOZE_SUSPEND;
+    }
+
+    private void setDisplayState(int nextState) {
+        if (nextState == displayState) return;
+        displayState = nextState;
+        displayLit = isLit(nextState);
+        Log.i(TAG, "Display state=" + nextState + " lit=" + displayLit);
+        applySensorState();
+    }
+
+    private void applySensorState() {
+        if (!enabled || !displayLit) {
+            main.removeCallbacks(showIfStillNear);
+            hideOverlay();
+            stopSensor();
+            return;
+        }
+        startSensor();
+    }
+
+    private void startSensor() {
+        if (listening) return;
+        near = false;
+        bypassUntilFar = false;
+        final int epoch = ++sensorEpoch;
         try {
-            listening = sensorManager.registerListener(proximityListener,
-                    proximity, PROXIMITY_RATE_US, sensorHandler);
-            Log.i(TAG, "register proximity listener: " + listening
-                    + ", sensor=" + proximity.getName()
-                    + ", generation=" + sensorGeneration);
+            listening = sensorManager.registerListener(sensorListener, proximity,
+                    PROXIMITY_RATE_US, sensorHandler);
+            Log.i(TAG, "Sensor register=" + listening + " epoch=" + epoch
+                    + " state=" + displayState);
         } catch (Throwable t) {
             listening = false;
-            Log.e(TAG, "Cannot register proximity sensor after screen wake", t);
+            Log.e(TAG, "Sensor registration failed", t);
         }
     }
 
-    private void unregisterSensor() {
-        unregisterSensor(true);
-    }
-
-    private void unregisterSensor(boolean clearState) {
-        ++sensorGeneration; // invalidate callbacks queued from prior sessions
-        if (listening && sensorManager != null) {
+    private void stopSensor() {
+        ++sensorEpoch;
+        if (listening) {
             listening = false;
             try {
-                sensorManager.unregisterListener(proximityListener);
+                sensorManager.unregisterListener(sensorListener);
             } catch (Throwable t) {
-                Log.e(TAG, "Proximity unregister failed", t);
+                Log.e(TAG, "Sensor unregister failed", t);
             }
         }
-        lastSensorTimestampNanos = 0;
-        main.removeCallbacks(showIfStillNear);
-        if (clearState) {
-            near = false;
-            overrideUntilFar = false;
-        } else {
-            // Preserve known NEAR while an overlay is attached. Re-arming
-            // a listener must not make the next FAR sample look unchanged.
-        }
-    }
-
-    private void scheduleShow() {
-        if (overlayShowing || overrideUntilFar || !enabled || !interactive) return;
-        main.removeCallbacks(showIfStillNear);
-        main.postDelayed(showIfStillNear, NEAR_CONFIRM_MS);
+        near = false;
+        bypassUntilFar = false;
     }
 
     boolean isOverlayShowing() { return overlayShowing; }
 
     void exitOnLongPower() {
-        overrideUntilFar = true;
-        main.post(() -> {
-            resetWakeValidation();
-            coveredBeforeSleep = false;
-            Log.i(TAG, "Long power: dismiss and bypass until proximity FAR");
+        bypassUntilFar = true;
+        Handler h = main;
+        if (h != null) h.post(() -> {
             main.removeCallbacks(showIfStillNear);
             hideOverlay();
         });
     }
 
-    private void showOverlay() {
-        if (overlayShowing || overlay != null || !interactive || !enabled
-                || !near || overrideUntilFar || inputPreparing) return;
+    private void requestOverlay() {
+        if (overlayShowing || overlay != null || preparing || !enabled
+                || !displayLit || !near || bypassUntilFar) return;
         if (inputShield == null || !inputShield.isInstalled()) {
-            Log.e(TAG, "No system gesture shield; refusing incomplete touch protection");
-            overrideUntilFar = true;
+            Log.e(TAG, "Input shield not installed; cannot show pocket lock");
             return;
         }
-        inputPreparing = true;
-        final int generation = ++inputStartGeneration;
+        preparing = true;
+        final int epoch = ++preparationEpoch;
         inputShield.prepare(() -> {
-            if (generation != inputStartGeneration) return;
-            inputPreparing = false;
-            if (!enabled || !interactive || !near || overrideUntilFar
-                    || overlayShowing || overlay != null) {
+            if (epoch != preparationEpoch) return;
+            preparing = false;
+            if (enabled && displayLit && near && !bypassUntilFar && overlay == null) {
+                showOverlay();
+            } else {
                 inputShield.stop();
-                return;
             }
-            attachOverlay();
         }, () -> {
-            if (generation != inputStartGeneration) return;
-            inputPreparing = false;
-            overrideUntilFar = true;
-            Log.e(TAG, "Native navigation gesture shield unavailable; not showing overlay");
+            if (epoch != preparationEpoch) return;
+            preparing = false;
+            Log.e(TAG, "Gesture shield unavailable; no overlay");
         });
     }
 
-    private void attachOverlay() {
+    private void showOverlay() {
         try {
             Context module = systemContext.createPackageContext("org.pocketguard.lsp",
                     Context.CONTEXT_IGNORE_SECURITY);
             View content = LayoutInflater.from(module).inflate(R.layout.pocket_overlay, null);
             FrameLayout blocker = new FrameLayout(systemContext) {
-                @Override public boolean dispatchTouchEvent(MotionEvent event) {
-                    // Consume all touchscreen gestures, including edge swipes.
+                @Override public boolean dispatchTouchEvent(MotionEvent e) {
                     return true;
                 }
             };
             blocker.setClickable(true);
-            blocker.addView(content, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT));
+            blocker.addView(content, new FrameLayout.LayoutParams(-1, -1));
             blocker.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+
             WindowManager.LayoutParams params = new WindowManager.LayoutParams();
-            params.width = WindowManager.LayoutParams.MATCH_PARENT;
-            params.height = WindowManager.LayoutParams.MATCH_PARENT;
+            params.width = -1;
+            params.height = -1;
             params.gravity = Gravity.CENTER;
             params.format = PixelFormat.TRANSLUCENT;
-            // CrDroid's TYPE_SECURE_SYSTEM_OVERLAY is NOT_TOUCHABLE under
-            // Android 17 DisplayPolicy. Use a touchable privileged window above
-            // the navigation and notification bars instead.
+            // TYPE_SECURE_SYSTEM_OVERLAY is forcibly NOT_TOUCHABLE on A17.
             params.type = TYPE_SYSTEM_ERROR;
             params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                     | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
@@ -540,55 +302,57 @@ final class CrPocketController {
             params.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             params.setTitle("PocketMode:Framework");
-            try {
-                // Touches on this window must not extend the normal display timeout.
-                XposedHelpers.setIntField(params, "inputFeatures",
-                        DISABLE_USER_ACTIVITY_INPUT);
-            } catch (Throwable t) {
-                Log.e(TAG, "No inputFeatures support; fail open", t);
-                return;
-            }
+            XposedHelpers.setIntField(params, "inputFeatures",
+                    DISABLE_USER_ACTIVITY_INPUT);
             windowManager.addView(blocker, params);
             overlay = blocker;
             overlayShowing = true;
-            staleProbeAttempted = false;
-            main.removeCallbacks(staleSensorProbe);
-            main.postDelayed(staleSensorProbe, STALE_SENSOR_PROBE_MS);
-            disableShadeWhileBlocked();
-            Log.i(TAG, "Framework touch-blocking overlay attached, type=" + params.type
-                    + ", flags=0x" + Integer.toHexString(params.flags));
+            disableShade();
+            Log.i(TAG, "Pocket overlay attached displayState=" + displayState);
         } catch (Throwable t) {
-            Log.e(TAG, "Framework overlay creation failed; fail open", t);
-            restoreSystemBars();
-            inputShield.stop();
-            // Do not keep showing/retrying on a failed or permission-denied ROM.
-            overrideUntilFar = true;
+            Log.e(TAG, "Could not create pocket overlay", t);
+            if (inputShield != null) inputShield.stop();
+            restoreShade();
         }
     }
 
     private void hideOverlay() {
-        inputStartGeneration++; // invalidate any asynchronous shield preparation
-        inputPreparing = false;
-        if (main != null) main.removeCallbacks(staleSensorProbe);
-        // Make the high-priority monitor stop stealing gestures immediately;
-        // dispose its input channel on its own input looper.
+        ++preparationEpoch;
+        preparing = false;
         overlayShowing = false;
         if (inputShield != null) inputShield.stop();
-        View existing = overlay;
-        if (existing == null) {
-            restoreSystemBars();
-            return;
+        if (overlay != null) {
+            try {
+                windowManager.removeViewImmediate(overlay);
+                overlay = null;
+            } catch (Throwable t) {
+                overlayShowing = true; // keep POWER escape available
+                Log.e(TAG, "Cannot remove pocket overlay", t);
+            }
         }
+        restoreShade();
+    }
+
+    private void disableShade() {
         try {
-            windowManager.removeViewImmediate(existing);
-            overlay = null;
-            restoreSystemBars();
-            Log.i(TAG, "Framework pocket overlay removed");
+            if (statusBarManager == null)
+                statusBarManager = systemContext.getSystemService("statusbar");
+            if (statusBarManager == null) return;
+            XposedHelpers.callMethod(statusBarManager, "disable", DISABLE_EXPAND);
+            XposedHelpers.callMethod(statusBarManager, "disable2", DISABLE2_QS_AND_SHADE);
         } catch (Throwable t) {
-            // The overlay is still attached. Keep the long POWER escape
-            // available while exposing the error for troubleshooting.
-            overlayShowing = true;
-            Log.e(TAG, "Could not remove framework overlay; escape still armed", t);
+            Log.w(TAG, "Cannot disable notification shade", t);
+            restoreShade();
+        }
+    }
+
+    private void restoreShade() {
+        if (statusBarManager == null) return;
+        try {
+            XposedHelpers.callMethod(statusBarManager, "disable", 0);
+            XposedHelpers.callMethod(statusBarManager, "disable2", 0);
+        } catch (Throwable t) {
+            Log.w(TAG, "Cannot restore notification shade", t);
         }
     }
 }
