@@ -39,13 +39,15 @@ final class PocketController implements SensorEventListener {
     private static final long CONFIRM_MS = 120;
     private static final long FOREGROUND_POLL_MS = 700;
     private static final long HEARTBEAT_MS = 3000;
-    private static final long SENSOR_RECHECK_MS = 1500;
+    private static final long FAR_CONFIRM_MS = 100;
     private static final int INPUT_FEATURE_DISABLE_USER_ACTIVITY = 2;
     private static final long TEST_MS = 5000;
-    // TYPE_SECURE_SYSTEM_OVERLAY is intentionally excluded: Android's
-    // input policy treats it as non-touchable on several framework builds.
-    private static final int TYPE_STATUS_BAR_SUB_PANEL = 2017;
-    private static final int TYPE_APPLICATION_OVERLAY = 2038;
+    // Navigation-bar panel is above the normal status/notification and navigation
+    // bar layers in AOSP 17. SYSTEM_ERROR is a privileged fallback.
+    private static final int TYPE_NAVIGATION_BAR_PANEL = 2024;
+    private static final int TYPE_SYSTEM_ERROR = 2010;
+    private static final int DISABLE_STATUS_BAR_EXPAND = 0x00010000;
+    private static final int DISABLE2_SHADE_AND_QS = 0x5;
 
     private final Context context;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -69,35 +71,58 @@ final class PocketController implements SensorEventListener {
     private long lastSensorEventElapsed;
     private long overlayShownElapsed;
     private int blockedTouchEvents;
-    private final Runnable sensorRecheck = new Runnable() {
-        @Override public void run() {
-            if (!enabled || !near || overlay == null || testWindow || sm == null || prox == null)
-                return;
-            // On-change proximity sensors sometimes do not send FAR promptly.
-            // Re-registering requests a fresh initial reading from the HAL.
-            long sinceEvent = SystemClock.elapsedRealtime() - lastSensorEventElapsed;
-            if (sinceEvent >= SENSOR_RECHECK_MS) {
-                try {
-                    sm.unregisterListener(PocketController.this, prox);
-                    boolean ok = sm.registerListener(PocketController.this, prox,
-                            SensorManager.SENSOR_DELAY_FASTEST, main);
-                    if (!ok) {
-                        Log.e(TAG, "Proximity re-registration failed; release touch safely");
-                        bypass = true;
-                        hide();
-                        return;
-                    }
-                    Log.d(TAG, "Requested proximity re-sample after " + sinceEvent + "ms");
-                } catch (Throwable e) {
-                    Log.e(TAG, "Proximity refresh failed; releasing overlay", e);
-                    bypass = true;
-                    hide();
-                    return;
-                }
-            }
-            main.postDelayed(this, SENSOR_RECHECK_MS);
-        }
+    private Object statusBarManager;
+    private boolean statusBarRestricted;
+    private long farCandidateAt;
+    private final Runnable confirmFar = () -> {
+        if (near || !enabled) return;
+        long delay = SystemClock.elapsedRealtime() - farCandidateAt;
+        Log.i(TAG, "Confirmed proximity FAR; release overlay after " + delay + "ms");
+        releaseNearState();
     };
+
+    private void restrictSystemBars() {
+        try {
+            if (statusBarManager == null) {
+                statusBarManager = context.getSystemService("statusbar");
+            }
+            if (statusBarManager == null) {
+                Log.w(TAG, "StatusBarManager unavailable; high window remains active");
+                return;
+            }
+            XposedHelpers.callMethod(statusBarManager,
+                    "disable", DISABLE_STATUS_BAR_EXPAND);
+            XposedHelpers.callMethod(statusBarManager,
+                    "disable2", DISABLE2_SHADE_AND_QS);
+            statusBarRestricted = true;
+            Log.i(TAG, "Status bar shade and QS disabled during pocket overlay");
+        } catch (Throwable t) {
+            Log.e(TAG, "Status bar policy restriction failed", t);
+            // Undo any partial change immediately.
+            restoreSystemBars();
+        }
+    }
+
+    private void restoreSystemBars() {
+        if (statusBarManager == null) return;
+        try {
+            XposedHelpers.callMethod(statusBarManager, "disable", 0);
+            XposedHelpers.callMethod(statusBarManager, "disable2", 0);
+            statusBarRestricted = false;
+        } catch (Throwable t) {
+            Log.e(TAG, "Could not restore status bar controls", t);
+        }
+    }
+
+    private void releaseNearState() {
+        bypass = false;
+        foregroundWhitelisted = false;
+        main.removeCallbacks(confirmFar);
+        main.removeCallbacks(foregroundPoll);
+        pendingPowerChallenge = 0;
+        verifiedPowerChallenge = 0;
+        if (!testWindow) hide();
+    }
 
     private final class TouchBlocker extends FrameLayout {
         TouchBlocker(Context c) {
@@ -268,7 +293,7 @@ final class PocketController implements SensorEventListener {
                 Log.e(TAG, "No proximity sensor available");
             } else {
                 enabled = sm.registerListener(
-                        this, prox, SensorManager.SENSOR_DELAY_UI, main);
+                        this, prox, SensorManager.SENSOR_DELAY_FASTEST, main);
                 Log.i(TAG, "Pocket protection enabled=" + enabled + " (default ON)");
             }
         }
@@ -406,23 +431,24 @@ final class PocketController implements SensorEventListener {
         if (!enabled || event.sensor.getType() != Sensor.TYPE_PROXIMITY
                 || event.values == null || event.values.length == 0) return;
         lastSensorEventElapsed = SystemClock.elapsedRealtime();
-        boolean newNear = event.values[0] < event.sensor.getMaximumRange();
-        if (newNear == near) return;
-        near = newNear;
-        Log.i(TAG, "Proximity NEAR=" + near + " distance=" + event.values[0]
-                + " elapsedMs=" + lastSensorEventElapsed
-                + " overlayAgeMs=" + (overlay == null ? -1
-                : lastSensorEventElapsed - overlayShownElapsed));
-
-        if (!near) {
-            bypass = false;
-            foregroundWhitelisted = false;
-            main.removeCallbacks(foregroundPoll);
-            pendingPowerChallenge = 0;
-            verifiedPowerChallenge = 0;
-            if (!testWindow) hide();
-        } else {
+        boolean nextNear = event.values[0] < event.sensor.getMaximumRange();
+        if (nextNear == near) return;
+        near = nextNear;
+        long sensorEventAgeMs =
+                (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1000000L;
+        Log.i(TAG, "Proximity NEAR=" + near +
+                " distance=" + event.values[0] +
+                " sensorEventAgeMs=" + sensorEventAgeMs +
+                " overlayAgeMs=" + (overlay == null ? -1
+                        : lastSensorEventElapsed - overlayShownElapsed));
+        if (near) {
+            main.removeCallbacks(confirmFar);
             startForegroundPoll();
+        } else {
+            // Ignore short FAR/NEAR oscillations caused by sensor noise.
+            farCandidateAt = SystemClock.elapsedRealtime();
+            main.removeCallbacks(confirmFar);
+            main.postDelayed(confirmFar, FAR_CONFIRM_MS);
         }
     }
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
@@ -458,17 +484,21 @@ final class PocketController implements SensorEventListener {
                     FrameLayout.LayoutParams.MATCH_PARENT));
             view.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
             blockedTouchEvents = 0;
             int flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                     | WindowManager.LayoutParams.FLAG_FULLSCREEN
                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
-                    // Non-focusable windows still receive touch, without hijacking keys.
+                    // The power key must still be handled by system_server.
                     | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
 
             Throwable last = null;
             for (int type : new int[]{
-                    TYPE_STATUS_BAR_SUB_PANEL, TYPE_APPLICATION_OVERLAY}) {
+                    TYPE_NAVIGATION_BAR_PANEL, TYPE_SYSTEM_ERROR}) {
                 WindowManager.LayoutParams p = new WindowManager.LayoutParams(
                         WindowManager.LayoutParams.MATCH_PARENT,
                         WindowManager.LayoutParams.MATCH_PARENT,
@@ -493,10 +523,9 @@ final class PocketController implements SensorEventListener {
                     overlay = view;
                     overlayShownElapsed = SystemClock.elapsedRealtime();
                     testWindow = test;
-                    main.removeCallbacks(sensorRecheck);
-                    if (!test && near) {
-                        main.postDelayed(sensorRecheck, SENSOR_RECHECK_MS);
-                    }
+                    // These window layers sit above the navigation bar and
+                    // notification shade. Independently disable shade expansion.
+                    restrictSystemBars();
                     main.removeCallbacks(safety);
                     if (test) {
                         main.postDelayed(safety, TEST_MS);
@@ -525,7 +554,8 @@ final class PocketController implements SensorEventListener {
         main.removeCallbacks(showRunnable);
         main.removeCallbacks(safety);
         main.removeCallbacks(heartbeat);
-        main.removeCallbacks(sensorRecheck);
+        main.removeCallbacks(confirmFar);
+        restoreSystemBars();
         try {
             Settings.Global.putLong(context.getContentResolver(),
                     PocketPowerHook.ACTIVE_HEARTBEAT, 0L);
