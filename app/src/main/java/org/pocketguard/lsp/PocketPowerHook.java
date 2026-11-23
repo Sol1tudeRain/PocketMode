@@ -84,6 +84,35 @@ public final class PocketPowerHook {
                             consumeVeryLongUntilKeyUp = false;
                         }
                     });
+            // Listen to the actual framework wake/sleep transitions. The
+            // SCREEN_ON broadcast can be delayed, and AOD pulses do not always
+            // produce it at all. These methods run in system_server.
+            Set<XC_MethodHook.Unhook> wakeHooks = XposedBridge.hookAllMethods(
+                    policy, "startedWakingUp", new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            CrPocketController c = controller;
+                            if (c == null) return;
+                            // Default display group only; do not respond to
+                            // unrelated virtual display wake transitions.
+                            if (param.args.length > 0 && param.args[0] instanceof Integer
+                                    && ((Integer) param.args[0]) != 0) return;
+                            c.onFrameworkWakingUp();
+                            Log.i(TAG, "Framework startedWakingUp received");
+                        }
+                    });
+            Set<XC_MethodHook.Unhook> sleepHooks = XposedBridge.hookAllMethods(
+                    policy, "startedGoingToSleep", new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam param) {
+                            CrPocketController c = controller;
+                            if (c == null) return;
+                            if (param.args.length > 0 && param.args[0] instanceof Integer
+                                    && ((Integer) param.args[0]) != 0) return;
+                            c.onFrameworkGoingToSleep();
+                            Log.i(TAG, "Framework startedGoingToSleep received");
+                        }
+                    });
+            Log.i(TAG, "Wake hooks=" + wakeHooks.size()
+                    + " sleep hooks=" + sleepHooks.size());
             escapeInstalled = true;
             Set<XC_MethodHook.Unhook> readyHooks = XposedBridge.hookAllMethods(
                     policy, "systemReady", new XC_MethodHook() {
