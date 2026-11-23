@@ -50,6 +50,11 @@ final class CrPocketController {
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long NEAR_CONFIRM_MS = 120;
     private static final long STALE_SENSOR_PROBE_MS = 6500;
+    // This device reported NEAR=0 before sleep but false FAR=5 during
+    // the entire next wake despite continuous physical cover. We must
+    // not trust the first wake samples or latch a false NEAR forever.
+    private static final long WAKE_RECHECK_MS = 900;
+    private static final long WAKE_VALIDATION_MS = 3400;
     private static final int PROXIMITY_RATE_US = 400000; // crDroid PocketService
     // AOSP/CrDroid 17 DisplayPolicy.adjustWindowParamsLw forcibly applies
     // FLAG_NOT_TOUCHABLE to TYPE_SECURE_SYSTEM_OVERLAY. Thus the original
@@ -83,6 +88,10 @@ final class CrPocketController {
     // lifecycle changes are serialized through the window UI handler.
     private volatile int sensorGeneration;
     private boolean near;
+    private boolean coveredBeforeSleep;
+    private boolean validatingWakeCover;
+    private boolean wakeNearConfirmed;
+    private int wakeFarSamples;
     private volatile boolean overrideUntilFar;
     private boolean interactive;
     private volatile boolean overlayShowing;
@@ -90,6 +99,45 @@ final class CrPocketController {
     private Object statusBarManager;
     private boolean statusBarRestricted;
     private long lastSensorTimestampNanos;
+
+    private void resetWakeValidation() {
+        if (main != null) {
+            main.removeCallbacks(wakeRecheck);
+            main.removeCallbacks(wakeValidationDeadline);
+        }
+        validatingWakeCover = false;
+        wakeNearConfirmed = false;
+        wakeFarSamples = 0;
+    }
+
+    private final Runnable wakeRecheck = () -> {
+        if (!validatingWakeCover || !interactive || !enabled || !listening)
+            return;
+        Log.i(TAG, "Wake recheck: re-register proximity; FAR samples="
+                + wakeFarSamples);
+        unregisterSensor(false); // retain temporary NEAR until verified
+        registerSensor();
+    };
+
+    private final Runnable wakeValidationDeadline = () -> {
+        if (!validatingWakeCover) return;
+        validatingWakeCover = false;
+        coveredBeforeSleep = false;
+        if (!wakeNearConfirmed && wakeFarSamples > 0) {
+            // The sensor only reports FAR after wake. Do not trap the user
+            // behind the overlay permanently; fail open after bounded grace.
+            Log.w(TAG, "Wake-cover validation expired: all FAR samples ("
+                    + wakeFarSamples + "), dismissing unverified cover");
+            near = false;
+            main.removeCallbacks(showIfStillNear);
+            hideOverlay();
+        } else {
+            Log.i(TAG, "Wake-cover validation retained: nearConfirmed="
+                    + wakeNearConfirmed + ", farSamples=" + wakeFarSamples);
+        }
+        wakeFarSamples = 0;
+    };
+
     private final Runnable staleSensorProbe = () -> {
         if (!enabled || !interactive || !listening || !near
                 || !overlayShowing || staleProbeAttempted) return;
@@ -163,8 +211,24 @@ final class CrPocketController {
                     return;
                 lastSensorTimestampNanos = eventTimestamp;
                 lastSensorReadingElapsed = SystemClock.elapsedRealtime();
-                // A fresh FAR sample also releases the long-POWER override if
-                // registration reset the previous near state on wake.
+                // During the first seconds after waking up while previously
+                // covered, the Xiaomi wake-up HAL has been observed to emit
+                // false FAR. Ask for a second registration before trusting it.
+                if (validatingWakeCover) {
+                    if (covered) {
+                        wakeNearConfirmed = true;
+                        validatingWakeCover = false;
+                        coveredBeforeSleep = false;
+                        main.removeCallbacks(wakeRecheck);
+                        main.removeCallbacks(wakeValidationDeadline);
+                        Log.i(TAG, "Wake cover confirmed by fresh NEAR");
+                    } else {
+                        wakeFarSamples++;
+                        Log.w(TAG, "Unverified wake FAR=" + distance
+                                + " sample=" + wakeFarSamples);
+                        return;
+                    }
+                }
                 if (!covered) overrideUntilFar = false;
                 Log.i(TAG, "Proximity sample distance=" + distance
                         + " max=" + proximity.getMaximumRange()
@@ -193,8 +257,18 @@ final class CrPocketController {
         sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
         powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
         windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-        proximity = sensorManager == null ? null
+        Sensor nonWakeup = sensorManager == null ? null
+                : sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY, false);
+        Sensor defaultProximity = sensorManager == null ? null
                 : sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+        // We do not listen during screen-off. Prefer the non-wakeup
+        // variant if provided, because this phone's wakeup variant
+        // returned persistent false FAR immediately after screen wake.
+        proximity = nonWakeup != null ? nonWakeup : defaultProximity;
+        Log.i(TAG, "Proximity candidates: default="
+                + (defaultProximity == null ? "none" : defaultProximity.getName())
+                + ", nonWakeup=" + (nonWakeup == null ? "none" : nonWakeup.getName())
+                + ", selected=" + (proximity == null ? "none" : proximity.getName()));
         interactive = powerManager != null && powerManager.isInteractive();
     }
 
@@ -267,23 +341,38 @@ final class CrPocketController {
             return;
         }
         if (!wasInteractive) {
-            // Wake transition is the only point where we must reset the
-            // previous cycle's state and ask for an initial new sample.
+            resetWakeValidation();
             unregisterSensor(true);
+            if (coveredBeforeSleep) {
+                // Latch the observed pre-sleep NEAR for a short, bounded
+                // wake grace period. Do not assume first FAR is correct.
+                validatingWakeCover = true;
+                near = true;
+                main.postDelayed(wakeRecheck, WAKE_RECHECK_MS);
+                main.postDelayed(wakeValidationDeadline, WAKE_VALIDATION_MS);
+                Log.i(TAG, "Wake with cached NEAR: verifying fresh sensor"
+                        + " (no sleep-time sensor listening)");
+            }
         }
         if (!listening) registerSensor();
         Log.i(TAG, reason + ": sensorListening=" + listening
-                + " near=" + near + " wasInteractive=" + wasInteractive);
+                + " near=" + near + " wasInteractive=" + wasInteractive
+                + " validating=" + validatingWakeCover);
         if (near && !overrideUntilFar) scheduleShow();
     }
 
     private void handleScreenSleep(String reason) {
         if (!interactive && !listening && overlay == null) return;
+        // Keep the last genuinely observed NEAR as a hint for next wake.
+        // The actual sensor listener is STILL fully unregistered in sleep.
+        coveredBeforeSleep = near || overlayShowing;
+        resetWakeValidation();
         interactive = false;
         main.removeCallbacks(showIfStillNear);
         hideOverlay();
         unregisterSensor(true);
-        Log.i(TAG, reason + ": sensor stopped, protection idle");
+        Log.i(TAG, reason + ": sensor stopped, cachedNear="
+                + coveredBeforeSleep);
     }
 
     private void refreshEnabled() {
@@ -306,6 +395,8 @@ final class CrPocketController {
             registerSensor();
             if (near) scheduleShow();
         } else {
+            resetWakeValidation();
+            coveredBeforeSleep = false;
             // Enabled but fully screen-off is deliberately sensor-idle.
             hideOverlay();
             unregisterSensor(true);
@@ -371,6 +462,8 @@ final class CrPocketController {
     void exitOnLongPower() {
         overrideUntilFar = true;
         main.post(() -> {
+            resetWakeValidation();
+            coveredBeforeSleep = false;
             Log.i(TAG, "Long power: dismiss and bypass until proximity FAR");
             main.removeCallbacks(showIfStillNear);
             hideOverlay();
