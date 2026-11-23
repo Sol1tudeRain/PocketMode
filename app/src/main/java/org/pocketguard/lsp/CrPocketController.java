@@ -4,6 +4,8 @@
  * One trigger: physical display state. ON and Doze/AOD mean check proximity;
  * OFF means stop proximity. No power-key wake heuristics, broadcast timing,
  * cached NEAR, notification intercept, or repeated sensor re-registration.
+ * Use the Xiaomi factory raw proximity samples to avoid false FAR from the
+ * standard on-change proximity HAL after waking while already covered.
  */
 package org.pocketguard.lsp;
 
@@ -38,6 +40,14 @@ final class CrPocketController {
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long NEAR_CONFIRM_MS = 120L;
     private static final int PROXIMITY_RATE_US = 400000;
+    private static final int RAW_TYPE = 33171005;
+    private static final int RAW_RATE_US = 200000; // 5 Hz while panel displays pixels
+    // Calibrated from SensorProbe on this exact handset: uncovered raw[0]
+    // ~40-60 and raw[1] ~175-190; covered raw[0] ~1023 and raw[1]
+    // ~1023-1158. The factory HAL's raw[2] is unreliable after wake.
+    private static final float RAW_NEAR_ADC = 600f;
+    private static final float RAW_FAR_ADC = 250f;
+    private static final float RAW_FAR_REFERENCE = 500f;
     private static final int TYPE_SYSTEM_ERROR = 2010;
     private static final int DISABLE_USER_ACTIVITY_INPUT = 2;
     private static final int DISABLE_EXPAND = 0x00010000;
@@ -48,6 +58,7 @@ final class CrPocketController {
     private final DisplayManager displayManager;
     private final WindowManager windowManager;
     private final Sensor proximity;
+    private final Sensor rawProximity;
     private final HandlerThread windowThread = new HandlerThread("PocketModeUi");
     private final HandlerThread sensorThread = new HandlerThread("PocketModeSensor");
     private Handler main;
@@ -58,6 +69,8 @@ final class CrPocketController {
     private int displayState = Display.STATE_UNKNOWN;
     private volatile boolean listening;
     private volatile int sensorEpoch;
+    private boolean rawListening;
+    private boolean rawDecisive;
     private boolean near;
     private volatile boolean overlayShowing;
     private volatile boolean bypassUntilFar;
@@ -86,27 +99,57 @@ final class CrPocketController {
                 }
             };
 
+    private void updateNear(boolean covered, String source) {
+        if (covered == near) return;
+        near = covered;
+        Log.i(TAG, "Proximity " + (near ? "NEAR" : "FAR")
+                + " source=" + source + " displayState=" + displayState);
+        if (near) {
+            main.removeCallbacks(showIfStillNear);
+            main.postDelayed(showIfStillNear, NEAR_CONFIRM_MS);
+        } else {
+            bypassUntilFar = false;
+            main.removeCallbacks(showIfStillNear);
+            hideOverlay();
+        }
+    }
+
     private final SensorEventListener sensorListener = new SensorEventListener() {
         @Override public void onSensorChanged(SensorEvent event) {
-            if (event.sensor.getType() != Sensor.TYPE_PROXIMITY
-                    || event.values == null || event.values.length == 0) return;
+            if (event.values == null || event.values.length == 0) return;
+            final int type = event.sensor.getType();
+            if (type != Sensor.TYPE_PROXIMITY && type != RAW_TYPE) return;
             final int epoch = sensorEpoch;
-            final float distance = event.values[0];
-            final boolean covered = distance < proximity.getMaximumRange();
+            final float a = event.values[0];
+            final float b = event.values.length > 1 ? event.values[1] : Float.NaN;
             main.post(() -> {
                 if (!enabled || !displayLit || !listening || epoch != sensorEpoch)
                     return;
-                if (covered == near) return;
-                near = covered;
-                Log.i(TAG, "Proximity " + (near ? "NEAR" : "FAR")
-                        + " distance=" + distance + " displayState=" + displayState);
-                if (near) {
-                    main.removeCallbacks(showIfStillNear);
-                    main.postDelayed(showIfStillNear, NEAR_CONFIRM_MS);
-                } else {
-                    bypassUntilFar = false;
-                    main.removeCallbacks(showIfStillNear);
-                    hideOverlay();
+                if (type == RAW_TYPE) {
+                    if (!rawListening || Float.isNaN(b)) return;
+                    // Uncovered: roughly (50,180); covered: (1023,1158)
+                    // or (1023,1023) immediately after power wake. Trust
+                    // actual ADC readings, NOT raw[2] nor standard FAR=5.
+                    Boolean rawNear = null;
+                    if (a >= RAW_NEAR_ADC && b >= RAW_NEAR_ADC) {
+                        rawNear = Boolean.TRUE;
+                    } else if (a <= RAW_FAR_ADC && b <= RAW_FAR_REFERENCE) {
+                        rawNear = Boolean.FALSE;
+                    }
+                    if (rawNear != null) {
+                        if (!rawDecisive) {
+                            Log.i(TAG, "Raw proximity first decision=" + rawNear
+                                    + " adc0=" + a + " adc1=" + b
+                                    + " epoch=" + epoch);
+                        }
+                        rawDecisive = true;
+                        updateNear(rawNear, "RAW adc0=" + a + " adc1=" + b);
+                    }
+                } else if (!rawListening || !rawDecisive) {
+                    // Fallback only until the factory ADC provides a
+                    // decisive reading, or if the factory sensor is absent.
+                    updateNear(a < proximity.getMaximumRange(),
+                            "STANDARD distance=" + a);
                 }
             });
         }
@@ -123,6 +166,17 @@ final class CrPocketController {
         Sensor standard = sensorManager == null ? null :
                 sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
         proximity = nonWakeup != null ? nonWakeup : standard;
+        Sensor factory = null;
+        if (sensorManager != null) {
+            for (Sensor candidate : sensorManager.getSensorList(Sensor.TYPE_ALL)) {
+                if (candidate.getType() == RAW_TYPE
+                        && candidate.getName().contains("TCS3720ALSPRX Proximity Sensor Strm")) {
+                    factory = candidate;
+                    break;
+                }
+            }
+        }
+        rawProximity = factory;
     }
 
     void init() {
@@ -150,7 +204,8 @@ final class CrPocketController {
         });
         // Retry once after system boot, when the module's provider becomes ready.
         main.postDelayed(this::readSwitch, 15000);
-        Log.i(TAG, "Simple display-driven controller: sensor=" + proximity.getName());
+        Log.i(TAG, "Display-driven controller: standard=" + proximity.getName()
+                + " raw=" + (rawProximity == null ? "unavailable" : rawProximity.getName()));
     }
 
     private void readSwitch() {
@@ -206,16 +261,28 @@ final class CrPocketController {
         if (listening) return;
         near = false;
         bypassUntilFar = false;
+        rawDecisive = false;
         final int epoch = ++sensorEpoch;
+        boolean standardOk = false;
+        boolean factoryOk = false;
         try {
-            listening = sensorManager.registerListener(sensorListener, proximity,
+            standardOk = sensorManager.registerListener(sensorListener, proximity,
                     PROXIMITY_RATE_US, sensorHandler);
-            Log.i(TAG, "Sensor register=" + listening + " epoch=" + epoch
-                    + " state=" + displayState);
         } catch (Throwable t) {
-            listening = false;
-            Log.e(TAG, "Sensor registration failed", t);
+            Log.e(TAG, "Standard proximity registration failed", t);
         }
+        if (rawProximity != null) {
+            try {
+                factoryOk = sensorManager.registerListener(sensorListener, rawProximity,
+                        RAW_RATE_US, sensorHandler);
+            } catch (Throwable t) {
+                Log.e(TAG, "Factory proximity registration failed", t);
+            }
+        }
+        rawListening = factoryOk;
+        listening = standardOk || factoryOk;
+        Log.i(TAG, "Sensor register standard=" + standardOk + " raw=" + factoryOk
+                + " epoch=" + epoch + " state=" + displayState);
     }
 
     private void stopSensor() {
@@ -228,6 +295,8 @@ final class CrPocketController {
                 Log.e(TAG, "Sensor unregister failed", t);
             }
         }
+        rawListening = false;
+        rawDecisive = false;
         near = false;
         bypassUntilFar = false;
     }
