@@ -52,7 +52,10 @@ public final class PocketHook implements IXposedHookLoadPackage {
                 new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
                         PocketController c = controller;
-                        if (c != null && c.suppressPulse()) p.setResult(false);
+                        if (c != null && c.suppressPulse()) {
+                            Log.i(TAG, "Blocked Doze notification pulse by proximity config");
+                            p.setResult(false);
+                        }
                     }
                 });
         } catch (Throwable e) { Log.w(TAG, "Doze config hook failed", e); }
@@ -64,6 +67,7 @@ public final class PocketHook implements IXposedHookLoadPackage {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
                         PocketController c = controller;
                         if (c == null || !c.suppressPulse()) return;
+                        Log.i(TAG, "Blocked DozeTriggers.onNotification while covered");
                         if (p.args.length > 0 && p.args[0] instanceof Runnable) {
                             try { ((Runnable)p.args[0]).run(); }
                             catch (Throwable e) { Log.w(TAG,"Pulse callback failed",e); }
