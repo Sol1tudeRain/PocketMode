@@ -5,13 +5,9 @@ android {
     defaultConfig {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
-        targetSdk 32
-        versionCode 7
-        versionName '0.7-touch-proximity-fixed-signing'
-    }
-    // Sideloaded LSPosed module; targetSdk 32 is deliberate for ROM compatibility.
-    lint {
-        disable 'ExpiredTargetSdkVersion'
+        targetSdk 35
+        versionCode 8
+        versionName '0.8-modern-target-sdk'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
