@@ -11,10 +11,6 @@ import android.os.Binder;
 import android.os.Bundle;
 import android.os.Process;
 
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.Set;
-
 /**
  * Device-protected, read-only IPC bridge from the module app to SystemUI.
  * Config writes happen only inside the module app and notify observers.
@@ -24,8 +20,6 @@ public final class ConfigProvider extends ContentProvider {
     public static final Uri URI = Uri.parse("content://" + AUTHORITY + "/settings");
     public static final String PREF_FILE = "pocketmode";
     public static final String KEY_ENABLED = "enabled";
-    public static final String KEY_WHITELIST = "whitelist";
-    public static final String KEY_TEST_SEQUENCE = "test_sequence";
 
     public static SharedPreferences preferences(Context c) {
         return c.createDeviceProtectedStorageContext()
@@ -58,9 +52,6 @@ public final class ConfigProvider extends ContentProvider {
         Bundle out = new Bundle();
         // First-install default = ON. The user can turn it off from the launcher UI.
         out.putBoolean(KEY_ENABLED, prefs.getBoolean(KEY_ENABLED, true));
-        Set<String> whitelist = prefs.getStringSet(KEY_WHITELIST, new HashSet<>());
-        out.putStringArrayList(KEY_WHITELIST, new ArrayList<>(whitelist));
-        out.putInt(KEY_TEST_SEQUENCE, prefs.getInt(KEY_TEST_SEQUENCE, 0));
         return out;
     }
 
