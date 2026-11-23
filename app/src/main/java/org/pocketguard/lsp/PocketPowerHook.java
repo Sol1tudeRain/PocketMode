@@ -65,7 +65,32 @@ public final class PocketPowerHook {
 
     static boolean isEscapeInstalled() { return escapeInstalled; }
 
+    private static void installTouchTimeoutHook(ClassLoader loader) {
+        try {
+            Class<?> service = XposedHelpers.findClass(
+                    "com.android.server.power.PowerManagerService", loader);
+            Class<?> group = XposedHelpers.findClass("com.android.server.power.PowerGroup", loader);
+            Method groupId = XposedHelpers.findMethodExact(group, "getGroupId");
+            // PowerManager.USER_ACTIVITY_EVENT_TOUCH and Display.DEFAULT_DISPLAY_GROUP
+            // are hidden SDK constants. The service updates the idle deadline after this point.
+            final int touch = 2;
+            final int defaultGroup = 0;
+            XposedHelpers.findAndHookMethod(service, "userActivityNoUpdateLocked", group,
+                    long.class, int.class, int.class, int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) throws Throwable {
+                    CrPocketController c = controller;
+                    if (c == null || !c.isOverlayShowing() || (int) p.args[2] != touch) return;
+                    if ((int) groupId.invoke(p.args[0]) == defaultGroup) p.setResult(false);
+                }
+            });
+            Log.i(TAG, "Pocket touch timeout hook installed");
+        } catch (Throwable t) {
+            Log.w(TAG, "Touch timeout hook unavailable; using pocket window input flag", t);
+        }
+    }
+
     static void install(XC_LoadPackage.LoadPackageParam lp) {
+        installTouchTimeoutHook(lp.classLoader);
         try {
             Class<?> policy = XposedHelpers.findClassIfExists(
                     "com.android.server.policy.PhoneWindowManager", lp.classLoader);
