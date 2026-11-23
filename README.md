@@ -1,4 +1,4 @@
-# PocketMode v1.6 — wake-triggered proximity and AOD notification screening
+# PocketMode v1.7 — wake proximity verification and AOD notification screening
 
 Experimental LSPosed module for Android 17 PixelOS, inspired by crDroid's
 pocket service architecture (original upstream Apache-2.0). This is not an
@@ -22,8 +22,19 @@ are experimental; if problems occur disable the module from LSPosed/recovery.
   registration early; the `ACTION_SCREEN_ON` broadcast is a fallback and
   does not redundantly unregister/re-register the same sensor.
 - Proximity `NEAR` while interactive requests a full-screen input-blocking
-  overlay. `FAR` immediately removes it. The POWER long press escape stays
-  in system_server, and normal auto screen-off is preserved.
+  overlay. Normally a fresh `FAR` immediately removes it. The POWER long
+  press escape stays in system_server, and normal auto screen-off is preserved.
+- **Covered wake-up regression:** on the user's PixelOS, the wake-up proximity
+  sensor returned `NEAR=0` before screen-off but repeatedly returned
+  `FAR=5` after screen wake while still physically covered. v1.7 prefers a
+  non-wake-up proximity sensor *if the vendor provides one*, since it only
+  monitors while awake. Additionally it caches a genuine last-known NEAR
+  across sleep without monitoring the sensor in standby. For the first 3.4s
+  after a covered wake, it shows a temporary overlay, triggers one re-register
+  after 900ms, and ignores the initial contradictory FAR. If no fresh NEAR
+  ever arrives and FAR persists, it **fails open** after 3.4s to avoid an
+  unremovable blocker. This is mitigation/diagnostic, not proof the HAL is
+  repaired. Physical testing is essential.
 - A locked-screen notification might generate only an ambient Doze/AOD pulse,
   **not** `SCREEN_ON`. In SystemUI, `PocketDozeHook` intercepts
   `DozeTriggers.onNotification` and uses its existing `ProximityCheck`
