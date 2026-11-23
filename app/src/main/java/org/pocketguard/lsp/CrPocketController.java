@@ -68,7 +68,7 @@ final class CrPocketController {
     private boolean interactive;
     private volatile boolean overlayShowing;
     private View overlay;
-    private long sensorLastEventElapsed;
+    private long lastSensorTimestampNanos;
 
     private final Runnable showIfStillNear = () -> {
         if (enabled && interactive && near && !overrideUntilFar
@@ -79,24 +79,26 @@ final class CrPocketController {
 
     private final SensorEventListener proximityListener = new SensorEventListener() {
         @Override public void onSensorChanged(SensorEvent event) {
-            if (event.sensor != proximity || event.values == null
+            if (event.sensor.getType() != Sensor.TYPE_PROXIMITY || event.values == null
                     || event.values.length == 0) return;
             final boolean covered = event.values[0] < proximity.getMaximumRange();
             final long now = SystemClock.elapsedRealtime();
             final float distance = event.values[0];
             final long eventTimestamp = event.timestamp;
             main.post(() -> {
-                // Old readings queued before a screen-off/unregister must not
-                // re-open the overlay.
-                if (!enabled || !interactive || !listening) return;
-                if (eventTimestamp > 0 && sensorLastEventElapsed > eventTimestamp) return;
-                sensorLastEventElapsed = eventTimestamp;
+                // Keep sensor state fresh while the screen is OFF, exactly as
+                // crDroid's PocketService does. Only the UI overlay is gated
+                // by whether the device is interactive.
+                if (!enabled || !listening) return;
+                if (eventTimestamp > 0 && lastSensorTimestampNanos > eventTimestamp)
+                    return;
+                lastSensorTimestampNanos = eventTimestamp;
                 if (covered == near) return;
                 near = covered;
                 Log.i(TAG, "Proximity " + (covered ? "NEAR" : "FAR")
                         + ", distance=" + distance + ", elapsed=" + now);
                 if (covered) {
-                    scheduleShow();
+                    if (interactive) scheduleShow();
                 } else {
                     overrideUntilFar = false;
                     main.removeCallbacks(showIfStillNear);
@@ -142,14 +144,22 @@ final class CrPocketController {
                         interactive = false;
                         main.removeCallbacks(showIfStillNear);
                         hideOverlay();
-                        unregisterSensor();
+                        // Deliberately do NOT unregister here: crDroid listens
+                        // during screen-off, so pocket state is ready on wake.
                     } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
                         interactive = true;
-                        // Clear a stale state and request a fresh initial sensor
-                        // reading on screen wake.
-                        near = false;
-                        overrideUntilFar = false;
-                        if (enabled) registerSensor();
+                        if (!enabled) return;
+                        if (!listening) registerSensor();
+                        if (proximity.isWakeUpSensor()) {
+                            // Wake-up proximity stays up to date during sleep.
+                            if (near) scheduleShow();
+                        } else {
+                            // Non-wakeup sensor events can be stale across
+                            // suspend. Re-arm ONCE per wake for a fresh sample,
+                            // not every 1.5 seconds as the old implementation.
+                            unregisterSensor(false);
+                            registerSensor();
+                        }
                     }
                 }
             }, screenFilter, Context.RECEIVER_NOT_EXPORTED);
@@ -163,7 +173,7 @@ final class CrPocketController {
         // introducing background polling.
         main.postDelayed(this::refreshEnabled, 15000);
         Log.i(TAG, "crDroid-style framework pocket controller ready, sensor="
-                + proximity.getName());
+                + proximity.getName() + ", wakeup=" + proximity.isWakeUpSensor());
     }
 
     private void refreshEnabled() {
@@ -182,10 +192,13 @@ final class CrPocketController {
         boolean wanted = state.getBoolean("enabled", true);
         if (wanted == enabled) return;
         enabled = wanted;
-        if (enabled && interactive) {
+        if (enabled) {
+            // CrDroid listens while the screen is OFF; extended to ON for
+            // user-requested unlocked-screen pocket protection.
             registerSensor();
+            if (interactive && near) scheduleShow();
         } else {
-            unregisterSensor();
+            unregisterSensor(true);
             hideOverlay();
         }
         Log.i(TAG, "PocketMode enabled=" + enabled);
@@ -202,13 +215,23 @@ final class CrPocketController {
     }
 
     private void unregisterSensor() {
-        if (!listening || sensorManager == null) return;
-        listening = false;
-        sensorManager.unregisterListener(proximityListener);
-        near = false;
-        sensorLastEventElapsed = 0;
-        overrideUntilFar = false;
+        unregisterSensor(true);
+    }
+
+    private void unregisterSensor(boolean clearState) {
+        if (listening && sensorManager != null) {
+            listening = false;
+            sensorManager.unregisterListener(proximityListener);
+        }
+        lastSensorTimestampNanos = 0;
         main.removeCallbacks(showIfStillNear);
+        if (clearState) {
+            near = false;
+            overrideUntilFar = false;
+        } else {
+            // Discard stale near state until HAL supplies a new reading.
+            near = false;
+        }
     }
 
     private void scheduleShow() {
