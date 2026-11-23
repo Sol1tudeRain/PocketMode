@@ -64,7 +64,7 @@ final class CrPocketController {
     private boolean enabled;
     private boolean listening;
     private boolean near;
-    private boolean overrideUntilFar;
+    private volatile boolean overrideUntilFar;
     private boolean interactive;
     private volatile boolean overlayShowing;
     private View overlay;
@@ -158,6 +158,10 @@ final class CrPocketController {
             return;
         }
         refreshEnabled();
+        // During early boot the user's package provider may not be ready yet.
+        // A one-shot post-boot retry keeps first-install default ON without
+        // introducing background polling.
+        main.postDelayed(this::refreshEnabled, 15000);
         Log.i(TAG, "crDroid-style framework pocket controller ready, sensor="
                 + proximity.getName());
     }
@@ -280,15 +284,16 @@ final class CrPocketController {
 
     private void hideOverlay() {
         View existing = overlay;
-        overlay = null;
-        overlayShowing = false;
-        if (existing != null) {
-            try {
-                windowManager.removeViewImmediate(existing);
-                Log.i(TAG, "Framework pocket overlay removed");
-            } catch (Throwable t) {
-                Log.e(TAG, "Could not remove framework overlay", t);
-            }
+        if (existing == null) return;
+        try {
+            windowManager.removeViewImmediate(existing);
+            overlay = null;
+            overlayShowing = false;
+            Log.i(TAG, "Framework pocket overlay removed");
+        } catch (Throwable t) {
+            // Retain the visibility flag so long POWER can retry dismissal
+            // rather than leaving a touch-blocking window with no escape.
+            Log.e(TAG, "Could not remove framework overlay; escape still armed", t);
         }
     }
 }
