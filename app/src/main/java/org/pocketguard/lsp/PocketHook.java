@@ -8,12 +8,16 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/** Hook only com.android.systemui, not system_server. */
+/** SystemUI overlay and system_server power-key escape hooks. */
 public final class PocketHook implements IXposedHookLoadPackage {
     private static volatile PocketController controller;
     private static final String TAG = "PocketGuardLSP";
 
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+        if ("android".equals(lp.packageName) && "android".equals(lp.processName)) {
+            PocketPowerHook.install(lp);
+            return;
+        }
         if (!"com.android.systemui".equals(lp.packageName) ||
             !"com.android.systemui".equals(lp.processName)) return;
 
