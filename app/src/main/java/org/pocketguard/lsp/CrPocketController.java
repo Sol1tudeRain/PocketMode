@@ -77,6 +77,16 @@ final class CrPocketController {
     private boolean inputPreparing;
     private long lastSensorReadingElapsed;
     private boolean staleProbeAttempted;
+    private boolean enabled;
+    private boolean listening;
+    private boolean near;
+    private volatile boolean overrideUntilFar;
+    private boolean interactive;
+    private volatile boolean overlayShowing;
+    private View overlay;
+    private Object statusBarManager;
+    private boolean statusBarRestricted;
+    private long lastSensorTimestampNanos;
     private final Runnable staleSensorProbe = () -> {
         if (!enabled || !near || !overlayShowing || staleProbeAttempted) return;
         long idle = SystemClock.elapsedRealtime() - lastSensorReadingElapsed;
@@ -94,16 +104,6 @@ final class CrPocketController {
             }
         }
     };
-    private boolean enabled;
-    private boolean listening;
-    private boolean near;
-    private volatile boolean overrideUntilFar;
-    private boolean interactive;
-    private volatile boolean overlayShowing;
-    private View overlay;
-    private Object statusBarManager;
-    private boolean statusBarRestricted;
-    private long lastSensorTimestampNanos;
 
     private void disableShadeWhileBlocked() {
         try {
