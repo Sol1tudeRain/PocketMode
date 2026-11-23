@@ -462,7 +462,9 @@ final class PocketController implements SensorEventListener {
             blockedTouchEvents = 0;
             int flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                     | WindowManager.LayoutParams.FLAG_FULLSCREEN
-                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED;
+                    | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                    // Non-focusable windows still receive touch, without hijacking keys.
+                    | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
 
             Throwable last = null;
             for (int type : new int[]{
