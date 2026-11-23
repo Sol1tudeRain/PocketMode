@@ -57,6 +57,8 @@ final class CrPocketController {
     private PocketInputShield inputShield;
     private volatile boolean enabled;
     private Runnable pendingWake;
+    private PowerManager.WakeLock probeLock;
+    private boolean waitingForFrame;
     private Runnable screenReady;
     private Runnable wakeTimeout;
     private volatile boolean manualWake;
@@ -65,6 +67,7 @@ final class CrPocketController {
     private boolean standardSample;
     private final Runnable expireManualWake = () -> {
         manualWake = false;
+        resumeWake();
         releaseScreen();
         applySensorState();
     };
@@ -287,11 +290,13 @@ final class CrPocketController {
     }
 
     private boolean isAmbient() {
-        return displayState == Display.STATE_DOZE || displayState == Display.STATE_DOZE_SUSPEND;
+        PowerManager pm = systemContext.getSystemService(PowerManager.class);
+        return displayState == Display.STATE_DOZE || displayState == Display.STATE_DOZE_SUSPEND
+                || (displayState == Display.STATE_ON && pm != null && !pm.isInteractive());
     }
 
     private boolean canShow() {
-        return displayState == Display.STATE_ON || manualWake;
+        return manualWake || (displayState == Display.STATE_ON && !isAmbient());
     }
 
     private void sleepAmbient() {
@@ -314,11 +319,25 @@ final class CrPocketController {
         main.post(() -> {
             if (!canCheckPowerWake()) { wake.run(); return; }
             if (manualWake) {
-                if (pendingWake == null) wake.run();
+                Runnable earlier = pendingWake;
+                if (earlier == null) wake.run();
+                else pendingWake = () -> {
+                    earlier.run();
+                    wake.run();
+                };
                 return;
             }
             manualWake = true;
             pendingWake = wake;
+            // POWER-up may release the policy wake lock before the RAW sample arrives.
+            // A partial lock runs the probe without lighting the panel.
+            if (probeLock == null) {
+                PowerManager pm = systemContext.getSystemService(PowerManager.class);
+                probeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketMode:probe");
+                probeLock.setReferenceCounted(false);
+            }
+            probeLock.acquire(1500);
+            waitingForFrame = false;
             main.removeCallbacks(expireManualWake);
             main.postDelayed(expireManualWake, 2500);
             startSensor();
@@ -339,10 +358,8 @@ final class CrPocketController {
             return;
         }
         if (pendingWake == null) return;
-        if (preparing || overlayShowing) {
-            if (frameReady) resumeWake();
-            return;
-        }
+        if (waitingForFrame) return;
+        waitingForFrame = true;
         if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
         updateNear(true, "power wake");
         requestOverlay();
@@ -361,6 +378,8 @@ final class CrPocketController {
         Runnable wake = pendingWake;
         pendingWake = null;
         if (wake != null) wake.run();
+        // The bounded lock bridges the queued policy callback as well as sampling.
+
     }
 
     void whenScreenReady(Runnable unblock) {
