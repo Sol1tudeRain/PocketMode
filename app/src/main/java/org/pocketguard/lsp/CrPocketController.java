@@ -129,7 +129,7 @@ final class CrPocketController {
             Log.w(TAG, "Wake-cover validation expired: all FAR samples ("
                     + wakeFarSamples + "), dismissing unverified cover");
             near = false;
-            main.removeCallbacks(showIfStillNear);
+            cancelPendingShow();
             hideOverlay();
         } else {
             Log.i(TAG, "Wake-cover validation retained: nearConfirmed="
@@ -192,6 +192,10 @@ final class CrPocketController {
             showOverlay();
         }
     };
+
+    private void cancelPendingShow() {
+        if (main != null) main.removeCallbacks(showIfStillNear);
+    }
 
     private final SensorEventListener proximityListener = new SensorEventListener() {
         @Override public void onSensorChanged(SensorEvent event) {
