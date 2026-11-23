@@ -1,7 +1,7 @@
 name: Build PocketMode APK
 on:
   push:
-    branches: [main]
+    branches: [main, experimental/crdroid-framework-port]
   pull_request:
     branches: [main]
   workflow_dispatch:
