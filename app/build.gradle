@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 15
-        versionName '1.5-on-demand-proximity'
+        versionCode 16
+        versionName '1.6-wake-doze-pulse'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
