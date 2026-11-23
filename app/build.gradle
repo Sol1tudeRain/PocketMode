@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 12
-        versionName '1.2-crdroid-a17-touch-corrected'
+        versionCode 13
+        versionName '1.3-native-gesture-shield'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
