@@ -1,8 +1,6 @@
 package org.pocketguard.lsp;
 
-import android.app.ActivityManager;
 import android.content.BroadcastReceiver;
-import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -27,9 +25,6 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.WindowManager;
 
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /** SystemUI-side controller. Reads default-on settings from the module APK. */
 final class PocketController implements SensorEventListener {
@@ -37,7 +32,6 @@ final class PocketController implements SensorEventListener {
     private static final Uri CONFIG_URI =
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long CONFIRM_MS = 120;
-    private static final long FOREGROUND_POLL_MS = 700;
     private static final long HEARTBEAT_MS = 3000;
     private static final long FAR_CONFIRM_MS = 100;
     private static final int INPUT_FEATURE_DISABLE_USER_ACTIVITY = 2;
@@ -55,19 +49,14 @@ final class PocketController implements SensorEventListener {
     private final Sensor prox;
     private final WindowManager wm;
     private final PowerManager pm;
-    private final ActivityManager am;
 
     private volatile boolean enabled;
     private volatile boolean near;
     private volatile boolean bypass;
-    private volatile boolean foregroundWhitelisted;
-    private final Set<String> whitelist = new HashSet<>();
     private boolean pending;
     private boolean testWindow;
     private View overlay;
     private int lastTestSequence = -1;
-    private String lastTopPackage = "";
-    private boolean warnedTaskFailure;
     private long lastSensorEventElapsed;
     private long overlayShownElapsed;
     private int blockedTouchEvents;
@@ -116,9 +105,7 @@ final class PocketController implements SensorEventListener {
 
     private void releaseNearState() {
         bypass = false;
-        foregroundWhitelisted = false;
         main.removeCallbacks(confirmFar);
-        main.removeCallbacks(foregroundPoll);
         pendingPowerChallenge = 0;
         verifiedPowerChallenge = 0;
         if (!testWindow) hide();
@@ -179,26 +166,12 @@ final class PocketController implements SensorEventListener {
         }
     };
 
-    private final Runnable foregroundPoll = new Runnable() {
-        @Override public void run() {
-            if (!enabled || !near) return;
-            updateForeground();
-            if (foregroundWhitelisted) {
-                if (!testWindow) hide();
-            } else {
-                schedule();
-            }
-            main.postDelayed(this, FOREGROUND_POLL_MS);
-        }
-    };
-
     PocketController(Context ctx) {
         context = ctx;
         sm = (SensorManager) ctx.getSystemService(Context.SENSOR_SERVICE);
         prox = sm == null ? null : sm.getDefaultSensor(Sensor.TYPE_PROXIMITY);
         wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
         pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
-        am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
     }
 
     void init() {
@@ -242,7 +215,6 @@ final class PocketController implements SensorEventListener {
                     } else if (Intent.ACTION_SCREEN_ON.equals(action)
                             || Intent.ACTION_USER_PRESENT.equals(action)) {
                         if (near) {
-                            updateForeground();
                             schedule();
                         }
                     }
@@ -270,10 +242,6 @@ final class PocketController implements SensorEventListener {
         }
 
         boolean wanted = state.getBoolean("enabled", true);
-        ArrayListHolder holder = new ArrayListHolder(state.getStringArrayList("whitelist"));
-        whitelist.clear();
-        whitelist.addAll(holder.values);
-
         int seq = state.getInt("test_sequence", 0);
         boolean manualTest = lastTestSequence >= 0 && seq != lastTestSequence;
         lastTestSequence = seq;
@@ -284,7 +252,6 @@ final class PocketController implements SensorEventListener {
                 if (sm != null) sm.unregisterListener(this);
                 near = false;
                 bypass = false;
-                main.removeCallbacks(foregroundPoll);
                 pendingPowerChallenge = 0;
                 verifiedPowerChallenge = 0;
                 if (!testWindow) hide();
@@ -298,17 +265,9 @@ final class PocketController implements SensorEventListener {
             }
         }
 
-        if (enabled && near) {
-            updateForeground();
-            if (foregroundWhitelisted && !testWindow) hide();
-            else schedule();
-            startForegroundPoll();
-        }
+        if (enabled && near) schedule();
 
-        Log.i(TAG, "Settings: enabled=" + enabled +
-                ", whitelistCount=" + whitelist.size() +
-                ", foreground=" + lastTopPackage +
-                ", excluded=" + foregroundWhitelisted);
+        Log.i(TAG, "Settings: enabled=" + enabled);
 
         if (manualTest) {
             Log.i(TAG, "Manual UI test requested");
@@ -371,60 +330,10 @@ final class PocketController implements SensorEventListener {
             verifiedPowerChallenge = response;
             lastPowerProofAt = SystemClock.elapsedRealtime();
             Log.i(TAG, "Live system_server POWER escape verified");
-            if (enabled && near && !bypass && !foregroundWhitelisted) schedule();
+            if (enabled && near && !bypass) schedule();
         } catch (Throwable t) {
             Log.e(TAG, "Power escape acknowledgement invalid", t);
         }
-    }
-
-    // Keep the provider's returned list independent from Bundle internals.
-    private static final class ArrayListHolder {
-        final Set<String> values = new HashSet<>();
-        ArrayListHolder(java.util.ArrayList<String> list) {
-            if (list != null) values.addAll(list);
-        }
-    }
-
-    private void startForegroundPoll() {
-        main.removeCallbacks(foregroundPoll);
-        if (enabled && near) main.post(foregroundPoll);
-    }
-
-    /**
-     * SystemUI is privileged and can generally inspect the resumed top task.
-     * If the ROM denies task inspection, log it and continue normal protection.
-     */
-    private void updateForeground() {
-        String top = null;
-        try {
-            if (am != null) {
-                List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
-                if (tasks != null && !tasks.isEmpty()) {
-                    ComponentName activity = tasks.get(0).topActivity;
-                    if (activity != null) top = activity.getPackageName();
-                }
-            }
-        } catch (Throwable e) {
-            if (!warnedTaskFailure) Log.e(TAG, "Foreground task lookup failed", e);
-            warnedTaskFailure = true;
-        }
-
-        if (top == null) {
-            if (!warnedTaskFailure) {
-                Log.w(TAG, "Foreground task unavailable; whitelist detection pending");
-                warnedTaskFailure = true;
-            }
-            // Avoid reclassifying unknown foreground activity as whitelisted.
-            foregroundWhitelisted = false;
-            return;
-        }
-
-        boolean excluded = "org.pocketguard.lsp".equals(top) || whitelist.contains(top);
-        if (!top.equals(lastTopPackage) || excluded != foregroundWhitelisted) {
-            Log.i(TAG, "Foreground=" + top + ", whitelisted=" + excluded);
-            lastTopPackage = top;
-        }
-        foregroundWhitelisted = excluded;
     }
 
     @Override public void onSensorChanged(SensorEvent event) {
@@ -443,7 +352,7 @@ final class PocketController implements SensorEventListener {
                         : lastSensorEventElapsed - overlayShownElapsed));
         if (near) {
             main.removeCallbacks(confirmFar);
-            startForegroundPoll();
+            schedule();
         } else {
             // Ignore short FAR/NEAR oscillations caused by sensor noise.
             farCandidateAt = SystemClock.elapsedRealtime();
@@ -454,20 +363,18 @@ final class PocketController implements SensorEventListener {
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
 
     boolean suppressPulse() {
-        return enabled && near && !bypass && !foregroundWhitelisted;
+        return enabled && near && !bypass;
     }
 
     private void schedule() {
-        if (!enabled || !near || bypass || foregroundWhitelisted ||
-                pending || overlay != null) return;
+        if (!enabled || !near || bypass || pending || overlay != null) return;
         pending = true;
         main.postDelayed(showRunnable, CONFIRM_MS);
     }
 
     private void maybeShow() {
         if (!enabled || !near || bypass || overlay != null) return;
-        updateForeground();
-        if (foregroundWhitelisted || pm == null || !pm.isInteractive()) return;
+        if (pm == null || !pm.isInteractive()) return;
         if (!powerEscapeReady()) return;
         showOverlay(false);
     }
