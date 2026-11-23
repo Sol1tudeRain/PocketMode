@@ -83,10 +83,9 @@ final class PocketController implements SensorEventListener {
     private final Runnable confirmFar = () -> {
         if (!near || !enabled || farCandidateAt == 0) return;
         long delay = SystemClock.elapsedRealtime() - farCandidateAt;
-        if (delay < farDelayMs) {
-            main.postDelayed(confirmFar, farDelayMs - delay);
-            return;
-        }
+        // Handler normally dispatches after the requested delay.
+        // Avoid recursively capturing the Runnable within its own initializer.
+        if (delay < farDelayMs) return;
         near = false;
         farCandidateAt = 0;
         rawConfirmedNear = false;
