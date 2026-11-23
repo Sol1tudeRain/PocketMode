@@ -81,7 +81,7 @@ public final class MainActivity extends Activity {
             ConfigProvider.notifyUpdated(this);
         });
 
-        TextView footer = label("crDroid 内核式实验版：LSPosed 勾选 Android 系统框架（android）和系统界面（com.android.systemui），安装后必须完整重启。", 12, MUTED, false);
+        TextView footer = label("简化版：普通亮屏及 AOD 显示时检测距离，完全熄屏时停止。LSPosed 仅勾选 android，安装后重启。", 12, MUTED, false);
         footer.setPadding(0, dp(22), 0, 0);
         root.addView(footer);
     }
