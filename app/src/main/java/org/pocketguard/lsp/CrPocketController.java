@@ -49,6 +49,7 @@ final class CrPocketController {
     private static final Uri SETTINGS_URI =
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long NEAR_CONFIRM_MS = 120;
+    private static final long STALE_SENSOR_PROBE_MS = 6500;
     private static final int PROXIMITY_RATE_US = 400000; // crDroid PocketService
     // AOSP/CrDroid 17 DisplayPolicy.adjustWindowParamsLw forcibly applies
     // FLAG_NOT_TOUCHABLE to TYPE_SECURE_SYSTEM_OVERLAY. Thus the original
@@ -60,13 +61,39 @@ final class CrPocketController {
     private static final int DISABLE2_QS_AND_SHADE = 0x5;
 
     private final Context systemContext;
-    private final Handler main = new Handler(Looper.getMainLooper());
+    // Do not dispatch sensor/UI updates on system_server's main looper. A
+    // navigation transition can stall that thread and leave a pocket view
+    // visible long after the distance sensor has reported FAR.
+    private final HandlerThread uiThread = new HandlerThread("PocketModeWindowUi");
+    private Handler main;
     private final SensorManager sensorManager;
     private final PowerManager powerManager;
     private final WindowManager windowManager;
     private final Sensor proximity;
     private final HandlerThread sensorThread = new HandlerThread("PocketModeSensors");
     private Handler sensorHandler;
+    private PocketInputShield inputShield;
+    private int inputStartGeneration;
+    private boolean inputPreparing;
+    private long lastSensorReadingElapsed;
+    private boolean staleProbeAttempted;
+    private final Runnable staleSensorProbe = () -> {
+        if (!enabled || !near || !overlayShowing || staleProbeAttempted) return;
+        long idle = SystemClock.elapsedRealtime() - lastSensorReadingElapsed;
+        if (idle >= STALE_SENSOR_PROBE_MS) {
+            staleProbeAttempted = true;
+            Log.w(TAG, "Proximity FAR not received for " + idle
+                    + "ms; requesting a single fresh HAL sample");
+            // Preserve NEAR here. Clearing it would make the subsequent FAR
+            // event look unchanged and leave a displayed overlay stuck.
+            unregisterSensor(false);
+            registerSensor();
+            if (!listening) {
+                overrideUntilFar = true;
+                hideOverlay();
+            }
+        }
+    };
     private boolean enabled;
     private boolean listening;
     private boolean near;
@@ -130,6 +157,7 @@ final class CrPocketController {
                 if (eventTimestamp > 0 && lastSensorTimestampNanos > eventTimestamp)
                     return;
                 lastSensorTimestampNanos = eventTimestamp;
+                lastSensorReadingElapsed = SystemClock.elapsedRealtime();
                 // A fresh FAR sample also releases the long-POWER override if
                 // registration reset the previous near state on wake.
                 if (!covered) overrideUntilFar = false;
@@ -140,6 +168,8 @@ final class CrPocketController {
                 if (covered) {
                     if (interactive) scheduleShow();
                 } else {
+                    main.removeCallbacks(staleSensorProbe);
+                    staleProbeAttempted = false;
                     overrideUntilFar = false;
                     main.removeCallbacks(showIfStillNear);
                     hideOverlay(); // FAR removes immediately, no timeout
@@ -164,6 +194,11 @@ final class CrPocketController {
             Log.e(TAG, "No proximity sensor / WindowManager / PowerManager, fail open");
             return;
         }
+        uiThread.start();
+        main = new Handler(uiThread.getLooper());
+        inputShield = new PocketInputShield(systemContext, main,
+                () -> overlayShowing);
+        inputShield.init();
         sensorThread.start();
         sensorHandler = new Handler(sensorThread.getLooper());
 
@@ -198,16 +233,17 @@ final class CrPocketController {
                             // suspend. Re-arm ONCE per wake for a fresh sample,
                             // not every 1.5 seconds as the old implementation.
                             unregisterSensor(false);
+                            near = false; // require a fresh sensor value after screen wake
                             registerSensor();
                         }
                     }
                 }
-            }, screenFilter, Context.RECEIVER_NOT_EXPORTED);
+            }, screenFilter, null, main, Context.RECEIVER_NOT_EXPORTED);
         } catch (Throwable e) {
             Log.e(TAG, "Screen receiver failed; disabling pocket protection", e);
             return;
         }
-        refreshEnabled();
+        main.post(this::refreshEnabled);
         // During early boot the user's package provider may not be ready yet.
         // A one-shot post-boot retry keeps first-install default ON without
         // introducing background polling.
@@ -269,8 +305,8 @@ final class CrPocketController {
             near = false;
             overrideUntilFar = false;
         } else {
-            // Discard stale near state until HAL supplies a new reading.
-            near = false;
+            // Preserve known NEAR while an overlay is attached. Re-arming
+            // a listener must not make the next FAR sample look unchanged.
         }
     }
 
@@ -293,7 +329,32 @@ final class CrPocketController {
 
     private void showOverlay() {
         if (overlayShowing || overlay != null || !interactive || !enabled
-                || !near || overrideUntilFar) return;
+                || !near || overrideUntilFar || inputPreparing) return;
+        if (inputShield == null || !inputShield.isInstalled()) {
+            Log.e(TAG, "No system gesture shield; refusing incomplete touch protection");
+            overrideUntilFar = true;
+            return;
+        }
+        inputPreparing = true;
+        final int generation = ++inputStartGeneration;
+        inputShield.prepare(() -> {
+            if (generation != inputStartGeneration) return;
+            inputPreparing = false;
+            if (!enabled || !interactive || !near || overrideUntilFar
+                    || overlayShowing || overlay != null) {
+                inputShield.stop();
+                return;
+            }
+            attachOverlay();
+        }, () -> {
+            if (generation != inputStartGeneration) return;
+            inputPreparing = false;
+            overrideUntilFar = true;
+            Log.e(TAG, "Native navigation gesture shield unavailable; not showing overlay");
+        });
+    }
+
+    private void attachOverlay() {
         try {
             Context module = systemContext.createPackageContext("org.pocketguard.lsp",
                     Context.CONTEXT_IGNORE_SECURITY);
@@ -343,29 +404,43 @@ final class CrPocketController {
             windowManager.addView(blocker, params);
             overlay = blocker;
             overlayShowing = true;
+            staleProbeAttempted = false;
+            main.removeCallbacks(staleSensorProbe);
+            main.postDelayed(staleSensorProbe, STALE_SENSOR_PROBE_MS);
             disableShadeWhileBlocked();
             Log.i(TAG, "Framework touch-blocking overlay attached, type=" + params.type
                     + ", flags=0x" + Integer.toHexString(params.flags));
         } catch (Throwable t) {
             Log.e(TAG, "Framework overlay creation failed; fail open", t);
             restoreSystemBars();
+            inputShield.stop();
             // Do not keep showing/retrying on a failed or permission-denied ROM.
             overrideUntilFar = true;
         }
     }
 
     private void hideOverlay() {
+        inputStartGeneration++; // invalidate any asynchronous shield preparation
+        inputPreparing = false;
+        if (main != null) main.removeCallbacks(staleSensorProbe);
+        // Make the high-priority monitor stop stealing gestures immediately;
+        // dispose its input channel on its own input looper.
+        overlayShowing = false;
+        if (inputShield != null) inputShield.stop();
         View existing = overlay;
-        if (existing == null) return;
+        if (existing == null) {
+            restoreSystemBars();
+            return;
+        }
         try {
             windowManager.removeViewImmediate(existing);
             overlay = null;
-            overlayShowing = false;
             restoreSystemBars();
             Log.i(TAG, "Framework pocket overlay removed");
         } catch (Throwable t) {
-            // Retain the visibility flag so long POWER can retry dismissal
-            // rather than leaving a touch-blocking window with no escape.
+            // The overlay is still attached. Keep the long POWER escape
+            // available while exposing the error for troubleshooting.
+            overlayShowing = true;
             Log.e(TAG, "Could not remove framework overlay; escape still armed", t);
         }
     }
