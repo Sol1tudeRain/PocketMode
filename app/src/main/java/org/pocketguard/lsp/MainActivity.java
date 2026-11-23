@@ -73,7 +73,7 @@ public final class MainActivity extends Activity {
         enabled.setTextSize(17);
         enabled.setChecked(prefs.getBoolean(ConfigProvider.KEY_ENABLED, true));
         panel.addView(enabled);
-        TextView hint = label("遮挡距离传感器时拦截触控。移开遮挡或长按电源键退出。", 13, MUTED, false);
+        TextView hint = label("遮挡时自动亮屏应保持黑屏；短按电源键显示口袋提示，长按电源键 3 秒退出。", 13, MUTED, false);
         hint.setPadding(0, dp(12), 0, 0);
         panel.addView(hint);
         enabled.setOnCheckedChangeListener((view, value) -> {
