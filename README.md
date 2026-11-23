@@ -1,73 +1,43 @@
-# PocketMode v1.1 — experimental crDroid framework port
+# PocketMode v1.3 — Android 17 framework gesture-shield experiment
 
-**This is an experimental branch. Do not replace a working v1.0 without
-a recovery route.** The code has not been tested on the target PixelOS 17
-system_server. Injecting code there can destabilize Android if a ROM policy
-is incompatible.
+An experimental LSPosed port adapting the *architecture* of crDroid / Paranoid Android's pocket protection to PixelOS Android 17.
 
-## What changed
+## Requirements and setup
 
-This implementation is adapted from the architecture of crDroid 17 /
-Paranoid Android:
+- PixelOS / Android 17, working proximity sensor, working LSPosed in `android` (system_server) process.
+- Enable **only `android`** in LSPosed; this implementation does not inject into SystemUI or Pixel Launcher.
+- Reboot the entire device after installing.
+- Open PocketMode: only one master enable/disable switch, default ON; there is no per-app whitelist.
+- **Keep a working recovery path.** This is not device-tested code. If system_server has trouble, disable the LSPosed module in recovery or using LSPosed's safe-mode mechanism.
 
-- `services/core/java/com/android/server/pocket/PocketService.java`
-  uses a `HandlerThread` for sensor state. Our
-  `CrPocketController.java` likewise separates sensor delivery from
-  the window UI thread and requests proximity events at 400,000 µs.
-- `services/core/java/com/android/server/policy/pocket/PocketLock.java`
-  uses `TYPE_SECURE_SYSTEM_OVERLAY`, but Android 17
-  `DisplayPolicy.adjustWindowParamsLw` **forcibly makes that type
-  `FLAG_NOT_TOUCHABLE`**. Therefore this LSPosed port deliberately uses
-  privileged, touchable `TYPE_SYSTEM_ERROR` with full-screen layout to
-  achieve the requested touch interception. This is a necessary deviation
-  from crDroid's view code.
-- `PhoneWindowManager.java` handles pocket visibility and long POWER.
-  The new `PocketPowerHook.java` handles POWER inside the same process as
-  the overlay, without any `Settings.Global` handshake or heartbeat.
-- Customizations: PocketMode also activates when unlocked (crDroid normally
-  limits the interactive display case to the keyguard), uses no UI fade
-  animation, and keeps the single default-on master switch.
-- Touches are consumed by the full-screen window and the hidden
-  `INPUT_FEATURE_DISABLE_USER_ACTIVITY` field is set so touch input
-  should not reset the user's screen timeout.
+## How it works
 
-There is no foreground-app whitelist, no per-700ms polling, no repeated
-sensor re-registration, and no 15-second auto-dismissal of the normal lock.
-Distance FAR removes the overlay immediately; long POWER exits while blocked,
-bypassing until proximity FAR.
+**Proximity:** `CrPocketController` uses crDroid's sensor-service pattern: a dedicated `HandlerThread`, an on-change proximity sensor, a 400,000µs requested sample interval, and continued sensor listening during screen-off. It also activates while unlocked, as requested. Screen wake re-arms non-wakeup sensors once. FAR requests immediate removal.
 
-## Installation
+**Independent UI thread:** A separate `PocketModeWindowUi` HandlerThread runs overlay lifecycle operations; a long-running system_server main-loop / navigation animation should no longer delay FAR dismissal. If a proximity sensor stops reporting while the overlay is active, one rearm requests a fresh HAL sample after 6.5 seconds; this is not an automatic overlay timeout.
 
-1. Keep your current stable APK for recovery.
-2. Install an APK built from this experimental branch.
-3. Set LSPosed scope **only to Android / `android` (system_server)**.
-4. Reboot completely; a SystemUI-only restart cannot load this architecture.
-5. Open the PocketMode app and use its single toggle.
+**Overlay:** Privileged `TYPE_SYSTEM_ERROR` window (rather than crDroid's `TYPE_SECURE_SYSTEM_OVERLAY`, which Android 17 forces `FLAG_NOT_TOUCHABLE`). A full-screen touch-absorbing View blocks app taps. The window uses `INPUT_FEATURE_DISABLE_USER_ACTIVITY` so touching does not prolong the screen-off timeout. Status bar/QS expansion is temporarily disabled and restored on dismiss.
 
-Debug logs: `logcat -d -s PocketModeCr:V PocketModePower:V | tail -n 80`.
+**System navigation gestures:** `PocketInputShield` starts a native Android `InputManager.monitorGestureInput` observer only when the overlay is prepared. On touchscreen `ACTION_DOWN`, `InputMonitor.pilferPointers()` takes the stream away from other input channels (including SystemUI edge-back and Quickstep home/recents gesture recognizers). It disposes the monitor immediately when the overlay is hidden; the receiver event is always finished normally. Android channels marked `DO_NOT_PILFER` cannot be canceled by this API, so **actual PixelOS behavior must be tested**.
 
-## Safety notes
+**Long POWER:** An LSPosed `PhoneWindowManager.powerLongPress` hook in the same system_server process cancels the global-actions menu and hides the overlay. Override persists until the proximity sensor reports FAR. Emergency key combinations are not modified.
 
-- This module is not a patch to the ROM's full `android.pocket` framework:
-  PixelOS has no crDroid-specific `PocketService`, manager APIs or internal
-  `pocket_lock_view` resource. It is an LSPosed port of the relevant logic.
-- The original test version mistakenly stopped monitoring proximity on
-  SCREEN_OFF. Fixed: the controller continues monitoring when screen is off
-  and only shows the overlay while interactive. A non-wakeup proximity sensor
-  is rearmed ONCE upon wake to request an up-to-date initial reading.
-- If the `PhoneWindowManager` power hook cannot be installed, the overlay
-  will not activate. If the privileged `TYPE_SYSTEM_ERROR` window type is
-  rejected, the module fails open instead of showing a touch-through overlay.
-- Android 17 framework behavior is verified against crDroid sources, but
-  actual PixelOS system_server compatibility and input delivery still
-  require physical device testing.
-- System emergency hardware key paths are not modified.
-- If boot issues occur, disable the module via LSPosed safe mode / recovery.
+## Debugging
 
-## Attribution / license
+Use Termux:
 
-The original pocket service and view code derives from Paranoid Android
-and crDroid framework components under the **Apache License 2.0**.
-Adapted architecture and window policy in this project are labeled in source.
+```sh
+su -c 'logcat -d -s PocketModeCr:V PocketModeInput:V PocketModePower:V | tail -n 80'
+```
 
-https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
+`su -c` runs the log command with root privileges, `-s` selects the three module log tags, and `tail -n 80` keeps the newest 80 lines.
+
+If native input monitoring cannot be registered, the overlay is **not** displayed; the module fails open rather than letting navigation gestures trigger behind an opaque touch blocker. This experimental port has passed APK compilation, not an end-to-end PixelOS device test.
+
+## Attribution and origin
+
+The original pocket service/controller inspiration comes from Paranoid Android and crDroid (Apache-2.0); Android's `InputManager`, `InputMonitor` and native `InputDispatcher` gesture-pilfer APIs provide the separate navigation gesture interception:
+- https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
+- https://github.com/crdroidandroid/android_frameworks_native/tree/17.0
+
+This project does not install crDroid's ROM-specific `android.pocket` system service into PixelOS.
