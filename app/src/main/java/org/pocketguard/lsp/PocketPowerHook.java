@@ -6,6 +6,8 @@ import android.database.ContentObserver;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.PowerManager;
+import android.view.KeyEvent;
 import android.provider.Settings;
 import android.util.Log;
 
@@ -29,6 +31,17 @@ public final class PocketPowerHook {
     static final String ACTIVE_HEARTBEAT = "pocketmode_active_heartbeat";
     static final String EXIT_REQUEST = "pocketmode_power_exit_request";
     private static final long MAX_HEARTBEAT_AGE_MS = 12500L;
+    /** Shared near flag, encoded with Settings.Global boot_count to reject stale boots. */
+    static final String PROX_GUARD = "pocketmode_proximity_guard_boot";
+    static final long POWER_EXIT_HOLD_MS = 3000L;
+    private static final String BOOT_COUNT = "boot_count";
+    private static volatile boolean escapeHooksInstalled;
+    private static volatile boolean held;
+    private static volatile boolean completed;
+    private static Context heldContext;
+    private static Handler keyHandler;
+    private static Runnable keyEscape;
+    private static long keyDownAt;
     private static volatile boolean consumeVeryLongUntilKeyUp;
     private static ContentObserver challengeObserver;
     private static long lastAcknowledgedChallenge;
@@ -46,52 +59,82 @@ public final class PocketPowerHook {
             Set<XC_MethodHook.Unhook> longPress = XposedBridge.hookAllMethods(
                     policy, "powerLongPress", new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam p) {
-                            Context context = getContext(p.thisObject);
-                            if (context == null || !isOverlayRecentlyActive(context)) return;
-                            if (requestExit(context)) {
-                                try {
-                                    XposedHelpers.setBooleanField(
-                                            p.thisObject, "mPowerKeyHandled", true);
-                                    consumeVeryLongUntilKeyUp = true;
-                                    p.setResult(null); // stop power menu / assistant
-                                    Log.i(TAG, "Long POWER: dismissed pocket mode; global actions blocked");
-                                } catch (Throwable t) {
-                                    Log.e(TAG, "Could not mark power key handled", t);
-                                }
+                            if (!held) return;
+                            // Hardware emergency power hold is not modified.
+                            try {
+                                XposedHelpers.setBooleanField(p.thisObject, "mPowerKeyHandled", true);
+                                p.setResult(null);
+                                Log.i(TAG, "Power menu deferred to 3-second pocket escape");
+                            } catch (Throwable t) {
+                                Log.e(TAG, "Power long-press hook failed", t);
                             }
                         }
                     });
             if (longPress.isEmpty()) {
-                Log.e(TAG, "powerLongPress not found, refusing handshake");
+                Log.e(TAG, "powerLongPress missing; no wake gating or handshake");
                 return;
             }
-            // Prevent the very-long-power software menu from appearing during
-            // the same physical key hold, even after the overlay has vanished.
+            // AOSP 16+ normally wakes from PhoneWindowManager.wakeUpFromWakeKey.
+            // Some older ROMs use wakeUpFromPowerKey. Hook both when present,
+            // rather than canceling the entire power-key input path.
+            XC_MethodHook gate = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (!isPowerWake(p.args)) return;
+                    Context context = getContext(p.thisObject);
+                    if (context == null || !isProximityGuarded(context)) return;
+                    PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+                    if (pm == null || pm.isInteractive()) return;
+                    if (completed) return;
+                    // Calling wakeUpFromWakeKey would light the display BEFORE
+                    // SystemUI could show a pocket overlay. Skip only that wake call.
+                    p.setResult(null);
+                    Log.i(TAG, "Blocked POWER wake before display turn-on");
+                }
+            };
+            boolean wakeHookOk = false;
+            for (String name : new String[]{"wakeUpFromWakeKey", "wakeUpFromPowerKey"}) {
+                try {
+                    Set<XC_MethodHook.Unhook> s = XposedBridge.hookAllMethods(policy, name, gate);
+                    wakeHookOk |= !s.isEmpty();
+                    if (!s.isEmpty()) Log.i(TAG, "Pre-wake hook installed: " + name);
+                } catch (Throwable t) {
+                    Log.w(TAG, "No pre-wake method " + name, t);
+                }
+            }
+            Set<XC_MethodHook.Unhook> down = XposedBridge.hookAllMethods(
+                    policy, "interceptPowerKeyDown", new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) {
+                            if (p.args.length == 0 || !(p.args[0] instanceof KeyEvent)) return;
+                            KeyEvent event = (KeyEvent) p.args[0];
+                            if (event.getKeyCode() == KeyEvent.KEYCODE_POWER
+                                    && event.getRepeatCount() == 0) {
+                                startHold(getContext(p.thisObject), event);
+                            }
+                        }
+                    });
+            Set<XC_MethodHook.Unhook> up = XposedBridge.hookAllMethods(
+                    policy, "interceptPowerKeyUp", new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            cancelHold();
+                        }
+                    });
             XposedBridge.hookAllMethods(policy, "powerVeryLongPress",
                     new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam p) {
-                            Context context = getContext(p.thisObject);
-                            boolean active = context != null && isOverlayRecentlyActive(context);
-                            if (!consumeVeryLongUntilKeyUp && !active) return;
-                            if (active && !consumeVeryLongUntilKeyUp) {
-                                if (!requestExit(context)) return;
-                                consumeVeryLongUntilKeyUp = true;
-                            }
+                            if (!held && !consumeVeryLongUntilKeyUp) return;
                             try {
                                 XposedHelpers.setBooleanField(p.thisObject, "mPowerKeyHandled", true);
                                 p.setResult(null);
-                                Log.i(TAG, "Power menu suppressed for same physical key hold");
                             } catch (Throwable t) {
-                                Log.e(TAG, "Failed to suppress very-long power menu", t);
+                                Log.w(TAG, "Could not defer very-long software action", t);
                             }
                         }
                     });
-            XposedBridge.hookAllMethods(policy, "interceptPowerKeyUp",
-                    new XC_MethodHook() {
-                        @Override protected void afterHookedMethod(MethodHookParam p) {
-                            consumeVeryLongUntilKeyUp = false;
-                        }
-                    });
+            escapeHooksInstalled = wakeHookOk && !down.isEmpty() && !up.isEmpty();
+            if (!escapeHooksInstalled) {
+                Log.e(TAG, "Incomplete wake/hold hooks; protection handshake disabled");
+                return;
+            }
             XposedBridge.hookAllMethods(policy, "systemReady",
                     new XC_MethodHook() {
                         @Override protected void afterHookedMethod(MethodHookParam p) {
@@ -136,6 +179,7 @@ public final class PocketPowerHook {
 
     private static void answerChallenge(ContentResolver resolver) {
         try {
+            if (!escapeHooksInstalled) return;
             long challenge = Settings.Global.getLong(resolver, READY_CHALLENGE, 0);
             if (challenge == 0 || challenge == lastAcknowledgedChallenge) return;
             if (Settings.Global.putLong(resolver, READY_ACK, challenge)) {
@@ -158,6 +202,94 @@ public final class PocketPowerHook {
             Log.e(TAG, "Power escape IPC failed; preserve original power behavior", t);
             return false;
         }
+    }
+
+    /**
+     * Only explicit POWER wake requests are blocked; alarms, calls, boot and
+     * other system wake reasons keep their original policy.
+     */
+    private static boolean isPowerWake(Object[] args) {
+        if (args == null || args.length == 0) return false;
+        if (args[0] instanceof KeyEvent) {
+            KeyEvent e = (KeyEvent) args[0];
+            return e.getKeyCode() == KeyEvent.KEYCODE_POWER
+                    && e.getAction() == KeyEvent.ACTION_DOWN;
+        }
+        // wakeUpFromWakeKey(long eventTime, int keyCode, boolean isDown)
+        if (args.length >= 3 && args[1] instanceof Integer
+                && args[2] instanceof Boolean) {
+            return ((Integer) args[1]) == KeyEvent.KEYCODE_POWER
+                    && ((Boolean) args[2]);
+        }
+        // Older wakeUpFromPowerKey(long eventTime).
+        return args.length == 1 && args[0] instanceof Long;
+    }
+
+    private static boolean isProximityGuarded(Context context) {
+        if (!escapeHooksInstalled) return false;
+        try {
+            ContentResolver r = context.getContentResolver();
+            int boot = Settings.Global.getInt(r, BOOT_COUNT, -1);
+            if (boot < 0) return false; // fail open if boot marker is unavailable
+            long state = Settings.Global.getLong(r, PROX_GUARD, 0);
+            return (state & 1L) == 1L && (state >>> 1) == (long)boot;
+        } catch (Throwable t) {
+            Log.w(TAG, "Cannot read proximity guard; allow normal wake", t);
+            return false;
+        }
+    }
+
+    private static synchronized void startHold(Context context, KeyEvent event) {
+        if (context == null || !escapeHooksInstalled || held || completed) return;
+        if (!isOverlayRecentlyActive(context) && !isProximityGuarded(context)) return;
+        held = true;
+        completed = false;
+        heldContext = context;
+        keyDownAt = event.getDownTime();
+        if (keyHandler == null) keyHandler = new Handler(Looper.getMainLooper());
+        keyEscape = () -> {
+            synchronized (PocketPowerHook.class) {
+                if (!held || completed) return;
+                long duration = SystemClock.uptimeMillis() - keyDownAt;
+                if (duration < POWER_EXIT_HOLD_MS) return;
+                Context c = heldContext;
+                if (c == null || !requestExit(c)) return;
+                completed = true;
+                consumeVeryLongUntilKeyUp = true;
+                try {
+                    ContentResolver r = c.getContentResolver();
+                    int boot = Settings.Global.getInt(r, BOOT_COUNT, -1);
+                    if (boot >= 0) Settings.Global.putLong(r, PROX_GUARD, (long) boot << 1);
+                } catch (Throwable t) { Log.w(TAG, "Cannot clear wake guard", t); }
+                PowerManager power = (PowerManager)c.getSystemService(Context.POWER_SERVICE);
+                if (power != null && !power.isInteractive()) {
+                    long now = SystemClock.uptimeMillis();
+                    try {
+                        XposedHelpers.callMethod(power, "wakeUp", now, 1,
+                                "PocketMode:3s-power-escape");
+                    } catch (Throwable first) {
+                        try { XposedHelpers.callMethod(power, "wakeUp", now); }
+                        catch (Throwable second) {
+                            Log.e(TAG, "3s exit sent; automatic display wake unavailable", second);
+                        }
+                    }
+                }
+                Log.i(TAG, "Physical POWER held >=3s: bypass pocket until FAR");
+            }
+        };
+        long remaining = Math.max(0L, POWER_EXIT_HOLD_MS
+                - (SystemClock.uptimeMillis() - keyDownAt));
+        keyHandler.postDelayed(keyEscape, remaining);
+        Log.i(TAG, "Pocket POWER hold started; exit at 3000ms");
+    }
+
+    private static synchronized void cancelHold() {
+        held = false;
+        completed = false;
+        consumeVeryLongUntilKeyUp = false;
+        if (keyHandler != null && keyEscape != null) keyHandler.removeCallbacks(keyEscape);
+        keyEscape = null;
+        heldContext = null;
     }
 
     private static Context getContext(Object policy) {
