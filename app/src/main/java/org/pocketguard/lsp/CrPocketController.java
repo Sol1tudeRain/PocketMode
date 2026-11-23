@@ -93,6 +93,9 @@ final class CrPocketController {
                 if (eventTimestamp > 0 && lastSensorTimestampNanos > eventTimestamp)
                     return;
                 lastSensorTimestampNanos = eventTimestamp;
+                // A fresh FAR sample also releases the long-POWER override if
+                // registration reset the previous near state on wake.
+                if (!covered) overrideUntilFar = false;
                 if (covered == near) return;
                 near = covered;
                 Log.i(TAG, "Proximity " + (covered ? "NEAR" : "FAR")
