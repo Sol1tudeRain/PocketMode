@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 17
-        versionName '1.7-wake-far-verification'
+        versionCode 18
+        versionName '1.8-simple-display-state'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
