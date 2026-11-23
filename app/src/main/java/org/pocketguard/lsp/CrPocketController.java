@@ -1,12 +1,3 @@
-/*
- * PocketMode for Android 17 / PixelOS.
- *
- * One trigger: physical display state. ON and Doze/AOD mean check proximity;
- * OFF means stop proximity. No power-key wake heuristics, broadcast timing,
- * cached NEAR, notification intercept, or repeated sensor re-registration.
- * Use the Xiaomi factory raw proximity samples to avoid false FAR from the
- * standard on-change proximity HAL after waking while already covered.
- */
 package org.pocketguard.lsp;
 
 import android.content.Context;
@@ -64,7 +55,19 @@ final class CrPocketController {
     private Handler main;
     private Handler sensorHandler;
     private PocketInputShield inputShield;
-    private boolean enabled;
+    private volatile boolean enabled;
+    private Runnable pendingWake;
+    private Runnable screenReady;
+    private Runnable wakeTimeout;
+    private volatile boolean manualWake;
+    private boolean frameReady;
+    private boolean standardCovered;
+    private boolean standardSample;
+    private final Runnable expireManualWake = () -> {
+        manualWake = false;
+        releaseScreen();
+        applySensorState();
+    };
     private boolean displayLit;
     private int displayState = Display.STATE_UNKNOWN;
     private volatile boolean listening;
@@ -80,7 +83,7 @@ final class CrPocketController {
     private Object statusBarManager;
 
     private final Runnable showIfStillNear = () -> {
-        if (enabled && displayLit && near && !bypassUntilFar
+        if (enabled && canShow() && near && !bypassUntilFar
                 && PocketPowerHook.isEscapeInstalled()) {
             requestOverlay();
         }
@@ -105,6 +108,10 @@ final class CrPocketController {
         Log.i(TAG, "Proximity " + (near ? "NEAR" : "FAR")
                 + " source=" + source + " displayState=" + displayState);
         if (near) {
+            if (isAmbient() && !manualWake) {
+                sleepAmbient();
+                return;
+            }
             main.removeCallbacks(showIfStillNear);
             main.postDelayed(showIfStillNear, NEAR_CONFIRM_MS);
         } else {
@@ -123,7 +130,7 @@ final class CrPocketController {
             final float a = event.values[0];
             final float b = event.values.length > 1 ? event.values[1] : Float.NaN;
             main.post(() -> {
-                if (!enabled || !displayLit || !listening || epoch != sensorEpoch)
+                if (!enabled || (!displayLit && !manualWake) || !listening || epoch != sensorEpoch)
                     return;
                 if (type == RAW_TYPE) {
                     if (!rawListening || Float.isNaN(b)) return;
@@ -144,12 +151,17 @@ final class CrPocketController {
                         }
                         rawDecisive = true;
                         updateNear(rawNear, "RAW adc0=" + a + " adc1=" + b);
+                        if (manualWake) decidePowerWake(rawNear);
                     }
                 } else if (!rawListening || !rawDecisive) {
                     // Fallback only until the factory ADC provides a
                     // decisive reading, or if the factory sensor is absent.
-                    updateNear(a < proximity.getMaximumRange(),
-                            "STANDARD distance=" + a);
+                    standardCovered = a < proximity.getMaximumRange();
+                    standardSample = true;
+                    if (!manualWake || !rawListening) {
+                        updateNear(standardCovered, "STANDARD distance=" + a);
+                        if (manualWake) decidePowerWake(standardCovered);
+                    }
                 }
             });
         }
@@ -241,6 +253,12 @@ final class CrPocketController {
 
     private void setDisplayState(int nextState) {
         if (nextState == displayState) return;
+        if (displayState == Display.STATE_ON && nextState != Display.STATE_ON && manualWake) {
+            manualWake = false;
+            pendingWake = null;
+            if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
+            releaseScreen();
+        }
         displayState = nextState;
         displayLit = isLit(nextState);
         Log.i(TAG, "Display state=" + nextState + " lit=" + displayLit);
@@ -248,20 +266,130 @@ final class CrPocketController {
     }
 
     private void applySensorState() {
-        if (!enabled || !displayLit) {
+        if (!enabled || (!displayLit && !manualWake)) {
             main.removeCallbacks(showIfStillNear);
             hideOverlay();
             stopSensor();
+            if (!enabled) {
+                manualWake = false;
+                resumeWake();
+                releaseScreen();
+            }
             return;
         }
         startSensor();
+        if (isAmbient() && !manualWake) {
+            hideOverlay();
+            if (near && !bypassUntilFar) sleepAmbient();
+        } else if (canShow() && near && !bypassUntilFar) {
+            main.post(showIfStillNear);
+        }
     }
+
+    private boolean isAmbient() {
+        return displayState == Display.STATE_DOZE || displayState == Display.STATE_DOZE_SUSPEND;
+    }
+
+    private boolean canShow() {
+        return displayState == Display.STATE_ON || manualWake;
+    }
+
+    private void sleepAmbient() {
+        PowerManager pm = systemContext.getSystemService(PowerManager.class);
+        if (pm == null || pm.isInteractive() || bypassUntilFar) return;
+        try {
+            // GO_TO_SLEEP_REASON_APPLICATION, GO_TO_SLEEP_FLAG_NO_DOZE
+            XposedHelpers.callMethod(pm, "goToSleep", android.os.SystemClock.uptimeMillis(), 0, 1);
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not blank covered ambient display", t);
+        }
+    }
+
+    boolean canCheckPowerWake() {
+        return enabled && main != null && PocketPowerHook.isEscapeInstalled()
+                && !bypassUntilFar;
+    }
+
+    void preparePowerWake(Runnable wake) {
+        main.post(() -> {
+            if (!canCheckPowerWake()) { wake.run(); return; }
+            if (manualWake) {
+                if (pendingWake == null) wake.run();
+                return;
+            }
+            manualWake = true;
+            pendingWake = wake;
+            main.removeCallbacks(expireManualWake);
+            main.postDelayed(expireManualWake, 2500);
+            startSensor();
+            if (rawDecisive || (!rawListening && standardSample)) {
+                decidePowerWake(near);
+            } else {
+                wakeTimeout = () -> decidePowerWake(standardSample && standardCovered);
+                main.postDelayed(wakeTimeout, 450);
+            }
+        });
+    }
+
+    private void decidePowerWake(boolean covered) {
+        if (!covered || bypassUntilFar || !enabled) {
+            manualWake = false;
+            resumeWake();
+            releaseScreen();
+            return;
+        }
+        if (pendingWake == null) return;
+        if (preparing || overlayShowing) {
+            if (frameReady) resumeWake();
+            return;
+        }
+        if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
+        updateNear(true, "power wake");
+        requestOverlay();
+        if (frameReady) resumeWake();
+        else {
+            // Some panels only schedule rendering after wake starts. In that case
+            // let the framework wake, keeping its backlight unblock callback gated.
+            wakeTimeout = this::resumeWake;
+            main.postDelayed(wakeTimeout, 180);
+        }
+    }
+
+    private void resumeWake() {
+        if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
+        wakeTimeout = null;
+        Runnable wake = pendingWake;
+        pendingWake = null;
+        if (wake != null) wake.run();
+    }
+
+    void whenScreenReady(Runnable unblock) {
+        main.post(() -> {
+            releaseScreen();
+            if (!manualWake || frameReady || !enabled || bypassUntilFar) unblock.run();
+            else {
+                screenReady = unblock;
+                main.postDelayed(screenDeadline, 900);
+            }
+        });
+    }
+
+    private final Runnable screenDeadline = this::releaseScreen;
+
+    private void releaseScreen() {
+        main.removeCallbacks(screenDeadline);
+        Runnable callback = screenReady;
+        screenReady = null;
+        if (callback != null) callback.run();
+    }
+
 
     private void startSensor() {
         if (listening) return;
         near = false;
         bypassUntilFar = false;
         rawDecisive = false;
+        standardSample = false;
         final int epoch = ++sensorEpoch;
         boolean standardOk = false;
         boolean factoryOk = false;
@@ -303,18 +431,22 @@ final class CrPocketController {
 
     boolean isOverlayShowing() { return overlayShowing; }
 
+    boolean isManualWake() { return manualWake; }
+
     void exitOnLongPower() {
         bypassUntilFar = true;
         Handler h = main;
         if (h != null) h.post(() -> {
             main.removeCallbacks(showIfStillNear);
             hideOverlay();
+            resumeWake();
+            releaseScreen();
         });
     }
 
     private void requestOverlay() {
         if (overlayShowing || overlay != null || preparing || !enabled
-                || !displayLit || !near || bypassUntilFar) return;
+                || !canShow() || !near || bypassUntilFar) return;
         if (inputShield == null || !inputShield.isInstalled()) {
             Log.e(TAG, "Input shield not installed; cannot show pocket lock");
             return;
@@ -324,7 +456,7 @@ final class CrPocketController {
         inputShield.prepare(() -> {
             if (epoch != preparationEpoch) return;
             preparing = false;
-            if (enabled && displayLit && near && !bypassUntilFar && overlay == null) {
+            if (enabled && canShow() && near && !bypassUntilFar && overlay == null) {
                 showOverlay();
             } else {
                 inputShield.stop();
@@ -341,6 +473,9 @@ final class CrPocketController {
             Context module = systemContext.createPackageContext("org.pocketguard.lsp",
                     Context.CONTEXT_IGNORE_SECURITY);
             View content = LayoutInflater.from(module).inflate(R.layout.pocket_overlay, null);
+            android.widget.TextView hint = content.findViewById(R.id.power_hint);
+            hint.setText(module.getString(R.string.pocket_mode_instruction_step2,
+                    PocketPowerHook.HOLD_SECONDS));
             FrameLayout blocker = new FrameLayout(systemContext) {
                 @Override public boolean dispatchTouchEvent(MotionEvent e) {
                     return true;
@@ -359,7 +494,8 @@ final class CrPocketController {
             params.width = -1;
             params.height = -1;
             params.gravity = Gravity.CENTER;
-            params.format = PixelFormat.TRANSLUCENT;
+            params.format = PixelFormat.OPAQUE;
+            params.windowAnimations = 0;
             // TYPE_SECURE_SYSTEM_OVERLAY is forcibly NOT_TOUCHABLE on A17.
             params.type = TYPE_SYSTEM_ERROR;
             params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -373,6 +509,12 @@ final class CrPocketController {
             params.setTitle("PocketMode:Framework");
             XposedHelpers.setIntField(params, "inputFeatures",
                     DISABLE_USER_ACTIVITY_INPUT);
+            blocker.getViewTreeObserver().registerFrameCommitCallback(() -> {
+                if (overlay != blocker) return;
+                frameReady = true;
+                resumeWake();
+                releaseScreen();
+            });
             windowManager.addView(blocker, params);
             overlay = blocker;
             overlayShowing = true;
@@ -387,6 +529,7 @@ final class CrPocketController {
 
     private void hideOverlay() {
         ++preparationEpoch;
+        frameReady = false;
         preparing = false;
         overlayShowing = false;
         if (inputShield != null) inputShield.stop();

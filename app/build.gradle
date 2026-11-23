@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 19
-        versionName '1.9-raw-proximity-adc'
+        versionCode 20
+        versionName '2.0-pocket-power'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

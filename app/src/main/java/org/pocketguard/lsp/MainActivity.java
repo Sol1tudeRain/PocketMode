@@ -73,7 +73,7 @@ public final class MainActivity extends Activity {
         enabled.setTextSize(17);
         enabled.setChecked(prefs.getBoolean(ConfigProvider.KEY_ENABLED, true));
         panel.addView(enabled);
-        TextView hint = label("遮挡距离传感器时拦截触控。移开遮挡或长按电源键退出。", 13, MUTED, false);
+        TextView hint = label("遮挡距离传感器时拦截触控。移开遮挡或长按电源键 " + PocketPowerHook.HOLD_SECONDS + " 秒退出。", 13, MUTED, false);
         hint.setPadding(0, dp(12), 0, 0);
         panel.addView(hint);
         enabled.setOnCheckedChangeListener((view, value) -> {
@@ -81,7 +81,7 @@ public final class MainActivity extends Activity {
             ConfigProvider.notifyUpdated(this);
         });
 
-        TextView footer = label("简化版：普通亮屏及 AOD 显示时检测距离，完全熄屏时停止。LSPosed 仅勾选 android，安装后重启。", 12, MUTED, false);
+        TextView footer = label("遮挡时短按电源键显示口袋模式。LSPosed 仅勾选 android，安装后重启。", 12, MUTED, false);
         footer.setPadding(0, dp(22), 0, 0);
         root.addView(footer);
     }
