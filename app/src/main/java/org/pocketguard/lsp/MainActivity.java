@@ -81,7 +81,7 @@ public final class MainActivity extends Activity {
             ConfigProvider.notifyUpdated(this);
         });
 
-        TextView footer = label("遮挡时短按电源键显示口袋模式。LSPosed 仅勾选 android，安装后重启。", 12, MUTED, false);
+        TextView footer = label("遮挡时短按电源键显示口袋模式。LSPosed 勾选系统框架和系统界面，安装后重启。", 12, MUTED, false);
         footer.setPadding(0, dp(22), 0, 0);
         root.addView(footer);
     }

@@ -4,9 +4,14 @@ import android.util.Log;
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/** The entire module runs only inside Android framework (system_server). */
+/** Power policy runs in system_server; ambient notification pulses originate in SystemUI. */
 public final class PocketHook implements IXposedHookLoadPackage {
     @Override public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+        if ("com.android.systemui".equals(lp.packageName)
+                && lp.packageName.equals(lp.processName)) {
+            PocketDozeHook.install(lp.classLoader);
+            return;
+        }
         if (!"android".equals(lp.packageName) || !"android".equals(lp.processName))
             return;
         try {

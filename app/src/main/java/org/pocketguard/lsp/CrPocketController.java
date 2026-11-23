@@ -142,12 +142,7 @@ final class CrPocketController {
                     // Uncovered: roughly (50,180); covered: (1023,1158)
                     // or (1023,1023) immediately after power wake. Trust
                     // actual ADC readings, NOT raw[2] nor standard FAR=5.
-                    Boolean rawNear = null;
-                    if (a >= RAW_NEAR_ADC && b >= RAW_NEAR_ADC) {
-                        rawNear = Boolean.TRUE;
-                    } else if (a <= RAW_FAR_ADC && b <= RAW_FAR_REFERENCE) {
-                        rawNear = Boolean.FALSE;
-                    }
+                    Boolean rawNear = classifyRaw(a, b);
                     if (rawNear != null) {
                         if (!rawDecisive) {
                             Log.i(TAG, "Raw proximity first decision=" + rawNear
@@ -185,17 +180,25 @@ final class CrPocketController {
         Sensor standard = sensorManager == null ? null :
                 sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
         proximity = nonWakeup != null ? nonWakeup : standard;
-        Sensor factory = null;
-        if (sensorManager != null) {
-            for (Sensor candidate : sensorManager.getSensorList(Sensor.TYPE_ALL)) {
+        rawProximity = findRaw(sensorManager);
+    }
+
+    static Sensor findRaw(SensorManager manager) {
+        if (manager != null) {
+            for (Sensor candidate : manager.getSensorList(Sensor.TYPE_ALL)) {
                 if (candidate.getType() == RAW_TYPE
                         && candidate.getName().contains("TCS3720ALSPRX Proximity Sensor Strm")) {
-                    factory = candidate;
-                    break;
+                    return candidate;
                 }
             }
         }
-        rawProximity = factory;
+        return null;
+    }
+
+    static Boolean classifyRaw(float a, float b) {
+        if (a >= RAW_NEAR_ADC && b >= RAW_NEAR_ADC) return Boolean.TRUE;
+        if (a <= RAW_FAR_ADC && b <= RAW_FAR_REFERENCE) return Boolean.FALSE;
+        return null;
     }
 
     void init() {

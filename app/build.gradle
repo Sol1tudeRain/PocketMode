@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 21
-        versionName '2.1-touch-timeout'
+        versionCode 22
+        versionName '2.2-notification-proximity'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
