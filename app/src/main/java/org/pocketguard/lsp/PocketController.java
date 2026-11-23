@@ -17,6 +17,9 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
+import android.provider.Settings;
+import de.robv.android.xposed.XposedHelpers;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
@@ -33,7 +36,8 @@ final class PocketController implements SensorEventListener {
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long CONFIRM_MS = 120;
     private static final long FOREGROUND_POLL_MS = 700;
-    private static final long WATCHDOG_MS = 15000;
+    private static final long HEARTBEAT_MS = 3000;
+    private static final int INPUT_FEATURE_DISABLE_USER_ACTIVITY = 2;
     private static final long TEST_MS = 5000;
     private static final int TYPE_SECURE_SYSTEM_OVERLAY = 2015;
     private static final int TYPE_STATUS_BAR_SUB_PANEL = 2017;
@@ -65,10 +69,28 @@ final class PocketController implements SensorEventListener {
     };
 
     private final Runnable safety = () -> {
-        if (overlay != null) {
-            if (!testWindow) bypass = true;
-            Log.w(TAG, "Overlay auto-released by watchdog");
+        if (overlay != null && testWindow) {
+            Log.i(TAG, "Five-second UI test finished");
             hide();
+        }
+    };
+
+    // Announce active overlay only while it is on screen. The system_server
+    // power hook uses this to intercept long POWER, never a stale global value.
+    private final Runnable heartbeat = new Runnable() {
+        @Override public void run() {
+            if (overlay == null || testWindow) return;
+            try {
+                Settings.Global.putLong(context.getContentResolver(),
+                        PocketPowerHook.ACTIVE_HEARTBEAT, SystemClock.elapsedRealtime());
+            } catch (Throwable t) {
+                Log.e(TAG, "Could not publish pocket heartbeat", t);
+                // No trusted power-key escape: fail open.
+                hide();
+                bypass = true;
+                return;
+            }
+            main.postDelayed(this, HEARTBEAT_MS);
         }
     };
 
@@ -101,6 +123,14 @@ final class PocketController implements SensorEventListener {
         context.getContentResolver().registerContentObserver(
                 CONFIG_URI, false, new ContentObserver(main) {
                     @Override public void onChange(boolean selfChange) { refreshConfig(); }
+                });
+
+        context.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(PocketPowerHook.EXIT_REQUEST), false,
+                new ContentObserver(main) {
+                    @Override public void onChange(boolean selfChange) {
+                        onPowerExitRequest();
+                    }
                 });
 
         IntentFilter filter = new IntentFilter();
@@ -192,6 +222,42 @@ final class PocketController implements SensorEventListener {
         }
     }
 
+    private void onPowerExitRequest() {
+        if (overlay == null || testWindow) return;
+        try {
+            long now = SystemClock.elapsedRealtime();
+            long exit = Settings.Global.getLong(context.getContentResolver(),
+                    PocketPowerHook.EXIT_REQUEST, 0);
+            if (exit > 0 && exit <= now && now - exit < 8000) {
+                Log.i(TAG, "Long POWER exit acknowledged: bypass until proximity FAR");
+                bypass = true;
+                hide();
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Power escape message failed", t);
+        }
+    }
+
+    private boolean powerEscapeReady() {
+        try {
+            int boot = Settings.Global.getInt(
+                    context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+            int readyBoot = Settings.Global.getInt(
+                    context.getContentResolver(), PocketPowerHook.READY_BOOT, -2);
+            long ready = Settings.Global.getLong(
+                    context.getContentResolver(), PocketPowerHook.READY_ELAPSED, 0);
+            long now = SystemClock.elapsedRealtime();
+            boolean ok = boot >= 0 && readyBoot == boot && ready > 0 && ready <= now;
+            if (!ok) {
+                Log.e(TAG, "No confirmed system_server POWER escape, refusing indefinite overlay");
+            }
+            return ok;
+        } catch (Throwable t) {
+            Log.e(TAG, "POWER escape readiness check failed", t);
+            return false;
+        }
+    }
+
     // Keep the provider's returned list independent from Bundle internals.
     private static final class ArrayListHolder {
         final Set<String> values = new HashSet<>();
@@ -276,6 +342,7 @@ final class PocketController implements SensorEventListener {
         if (!enabled || !near || bypass || overlay != null) return;
         updateForeground();
         if (foregroundWhitelisted || pm == null || !pm.isInteractive()) return;
+        if (!powerEscapeReady()) return;
         showOverlay(false);
     }
 
@@ -303,6 +370,18 @@ final class PocketController implements SensorEventListener {
                         WindowManager.LayoutParams.MATCH_PARENT,
                         type, flags, PixelFormat.TRANSLUCENT);
                 p.setTitle("PocketMode:SystemUI");
+                // Treat touches on this full-screen pocket overlay as NOT user activity,
+                // so the device's existing screen-off timer keeps counting down.
+                // This is a hidden but public-field WindowManager.LayoutParams member;
+                // writing the field is done inside the privileged SystemUI process.
+                try {
+                    XposedHelpers.setIntField(p, "inputFeatures",
+                            INPUT_FEATURE_DISABLE_USER_ACTIVITY);
+                } catch (Throwable e) {
+                    Log.e(TAG, "Cannot disable touch user-activity; fail open", e);
+                    if (!test) bypass = true;
+                    return;
+                }
                 p.layoutInDisplayCutoutMode =
                         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
                 try {
@@ -310,8 +389,13 @@ final class PocketController implements SensorEventListener {
                     overlay = view;
                     testWindow = test;
                     main.removeCallbacks(safety);
-                    main.postDelayed(safety, test ? TEST_MS : WATCHDOG_MS);
-                    Log.i(TAG, "Overlay shown; type=" + type + ", test=" + test);
+                    if (test) {
+                        main.postDelayed(safety, TEST_MS);
+                    } else {
+                        heartbeat.run();  // no automatic exit after 15 seconds
+                    }
+                    Log.i(TAG, "Overlay shown; type=" + type + ", test=" + test +
+                            ", touchDoesNotResetScreenTimeout=true");
                     return;
                 } catch (Throwable e) {
                     last = e;
@@ -331,6 +415,13 @@ final class PocketController implements SensorEventListener {
         pending = false;
         main.removeCallbacks(showRunnable);
         main.removeCallbacks(safety);
+        main.removeCallbacks(heartbeat);
+        try {
+            Settings.Global.putLong(context.getContentResolver(),
+                    PocketPowerHook.ACTIVE_HEARTBEAT, 0L);
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not clear pocket heartbeat", t);
+        }
         if (overlay != null) {
             try { wm.removeViewImmediate(overlay); }
             catch (Throwable e) { Log.e(TAG, "Overlay removal failed", e); }
