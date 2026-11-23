@@ -1,0 +1,16 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'org.pocketguard.sensorprobe'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'org.pocketguard.sensorprobe'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '1.0-sensor-diagnostics'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
