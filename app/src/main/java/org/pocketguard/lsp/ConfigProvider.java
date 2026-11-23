@@ -34,7 +34,7 @@ public final class ConfigProvider extends ContentProvider {
 
     private void enforceReader() {
         int uid = Binder.getCallingUid();
-        if (uid == Process.myUid()) return;
+        if (uid == Process.myUid() || uid == Process.SYSTEM_UID) return;
         PackageManager pm = getContext().getPackageManager();
         String[] packages = pm.getPackagesForUid(uid);
         if (packages != null) {
@@ -42,7 +42,7 @@ public final class ConfigProvider extends ContentProvider {
                 if ("com.android.systemui".equals(pkg)) return;
             }
         }
-        throw new SecurityException("PocketMode config may only be read by SystemUI");
+        throw new SecurityException("PocketMode config may only be read by Android framework");
     }
 
     @Override public Bundle call(String method, String arg, Bundle extras) {
