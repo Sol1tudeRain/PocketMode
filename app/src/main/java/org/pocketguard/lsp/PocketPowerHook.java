@@ -2,6 +2,9 @@ package org.pocketguard.lsp;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.database.ContentObserver;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
@@ -21,12 +24,14 @@ import java.util.Set;
  */
 public final class PocketPowerHook {
     private static final String TAG = "PocketGuardPower";
-    static final String READY_BOOT = "pocketmode_power_hook_ready_boot";
-    static final String READY_ELAPSED = "pocketmode_power_hook_ready_elapsed";
+    static final String READY_CHALLENGE = "pocketmode_power_hook_challenge";
+    static final String READY_ACK = "pocketmode_power_hook_ack";
     static final String ACTIVE_HEARTBEAT = "pocketmode_active_heartbeat";
     static final String EXIT_REQUEST = "pocketmode_power_exit_request";
     private static final long MAX_HEARTBEAT_AGE_MS = 12500L;
     private static volatile boolean consumeVeryLongUntilKeyUp;
+    private static ContentObserver challengeObserver;
+    private static long lastAcknowledgedChallenge;
 
     private PocketPowerHook() { }
 
@@ -95,23 +100,52 @@ public final class PocketPowerHook {
                                 Log.e(TAG, "No policy context; handshake unavailable");
                                 return;
                             }
-                            try {
-                                ContentResolver cr = context.getContentResolver();
-                                int boot = Settings.Global.getInt(
-                                        cr, Settings.Global.BOOT_COUNT, -1);
-                                long now = SystemClock.elapsedRealtime();
-                                boolean ok = Settings.Global.putInt(cr, READY_BOOT, boot)
-                                        && Settings.Global.putLong(cr, READY_ELAPSED, now);
-                                Log.i(TAG, "Power escape ready=" + ok +
-                                        " boot=" + boot + " elapsed=" + now);
-                            } catch (Throwable t) {
-                                Log.e(TAG, "Power escape handshake failed", t);
-                            }
+                            registerChallengeObserver(context);
                         }
                     });
             Log.i(TAG, "PhoneWindowManager POWER interception installed");
         } catch (Throwable t) {
             Log.e(TAG, "Failed to attach PhoneWindowManager hooks", t);
+        }
+    }
+
+    /**
+     * Responds only to a fresh request made by the current SystemUI controller.
+     * This avoids the boot_count race: systemReady may run before BOOT_COUNT
+     * increments, making a startup boot number look stale immediately.
+     */
+    private static synchronized void registerChallengeObserver(Context context) {
+        if (challengeObserver != null) return;
+        try {
+            final ContentResolver resolver = context.getContentResolver();
+            final Handler handler = new Handler(Looper.getMainLooper());
+            challengeObserver = new ContentObserver(handler) {
+                @Override public void onChange(boolean selfChange) {
+                    answerChallenge(resolver);
+                }
+            };
+            resolver.registerContentObserver(
+                    Settings.Global.getUriFor(READY_CHALLENGE), false, challengeObserver);
+            answerChallenge(resolver);
+            Log.i(TAG, "Live power-escape challenge listener installed");
+        } catch (Throwable t) {
+            challengeObserver = null;
+            Log.e(TAG, "Could not install power-escape challenge listener", t);
+        }
+    }
+
+    private static void answerChallenge(ContentResolver resolver) {
+        try {
+            long challenge = Settings.Global.getLong(resolver, READY_CHALLENGE, 0);
+            if (challenge == 0 || challenge == lastAcknowledgedChallenge) return;
+            if (Settings.Global.putLong(resolver, READY_ACK, challenge)) {
+                lastAcknowledgedChallenge = challenge;
+                Log.i(TAG, "Power-escape challenge acknowledged");
+            } else {
+                Log.e(TAG, "Power-escape challenge acknowledgement failed");
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Cannot answer power-escape challenge", t);
         }
     }
 
