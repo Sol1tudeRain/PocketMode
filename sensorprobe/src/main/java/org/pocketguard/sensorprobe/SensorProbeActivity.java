@@ -64,7 +64,7 @@ public final class SensorProbeActivity extends Activity {
     private Button button(LinearLayout parent, String title, View.OnClickListener click) {
         Button b = new Button(this);
         b.setText(title);
-        b.setTextAllCaps(false);
+        b.setAllCaps(false);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(52), 1f);
         lp.setMargins(dp(2), dp(3), dp(2), dp(3));
         parent.addView(b, lp);
