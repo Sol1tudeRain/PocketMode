@@ -50,7 +50,11 @@ final class CrPocketController {
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long NEAR_CONFIRM_MS = 120;
     private static final int PROXIMITY_RATE_US = 400000; // crDroid PocketService
-    private static final int TYPE_SECURE_SYSTEM_OVERLAY = 2015;
+    // AOSP/CrDroid 17 DisplayPolicy.adjustWindowParamsLw forcibly applies
+    // FLAG_NOT_TOUCHABLE to TYPE_SECURE_SYSTEM_OVERLAY. Thus the original
+    // crDroid PocketLock visual layer cannot consume touch input on this ROM.
+    // TYPE_SYSTEM_ERROR is a privileged *touchable* layer above the nav bar.
+    private static final int TYPE_SYSTEM_ERROR = 2010;
     private static final int DISABLE_USER_ACTIVITY_INPUT = 2;
 
     private final Context systemContext;
@@ -273,15 +277,21 @@ final class CrPocketController {
                     FrameLayout.LayoutParams.MATCH_PARENT));
             blocker.setSystemUiVisibility(View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION);
+                    | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
             WindowManager.LayoutParams params = new WindowManager.LayoutParams();
             params.width = WindowManager.LayoutParams.MATCH_PARENT;
             params.height = WindowManager.LayoutParams.MATCH_PARENT;
             params.gravity = Gravity.CENTER;
             params.format = PixelFormat.TRANSLUCENT;
-            // Same topmost framework window type and flags as crDroid PocketLock.
-            params.type = TYPE_SECURE_SYSTEM_OVERLAY;
-            params.flags = WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+            // CrDroid's TYPE_SECURE_SYSTEM_OVERLAY is NOT_TOUCHABLE under
+            // Android 17 DisplayPolicy. Use a touchable privileged window above
+            // the navigation and notification bars instead.
+            params.type = TYPE_SYSTEM_ERROR;
+            params.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                     | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
                     | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
                     | WindowManager.LayoutParams.FLAG_FULLSCREEN
@@ -300,7 +310,8 @@ final class CrPocketController {
             windowManager.addView(blocker, params);
             overlay = blocker;
             overlayShowing = true;
-            Log.i(TAG, "Framework pocket overlay attached with secure system layer");
+            Log.i(TAG, "Framework touch-blocking overlay attached, type=" + params.type
+                    + ", flags=0x" + Integer.toHexString(params.flags));
         } catch (Throwable t) {
             Log.e(TAG, "Framework overlay creation failed; fail open", t);
             // Do not keep showing/retrying on a failed or permission-denied ROM.
