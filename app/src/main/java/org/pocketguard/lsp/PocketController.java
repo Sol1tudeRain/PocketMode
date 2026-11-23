@@ -79,10 +79,14 @@ final class PocketController implements SensorEventListener {
     private Object statusBarManager;
     private boolean statusBarRestricted;
     private long farCandidateAt;
+    private long farDelayMs = FAR_CONFIRM_MS;
     private final Runnable confirmFar = () -> {
         if (!near || !enabled || farCandidateAt == 0) return;
         long delay = SystemClock.elapsedRealtime() - farCandidateAt;
-        if (delay < FAR_CONFIRM_MS) return;
+        if (delay < farDelayMs) {
+            main.postDelayed(confirmFar, farDelayMs - delay);
+            return;
+        }
         near = false;
         farCandidateAt = 0;
         rawConfirmedNear = false;
@@ -524,9 +528,13 @@ final class PocketController implements SensorEventListener {
                 powerEscapeReady();
                 schedule();
             }
-        } else if (near && farCandidateAt == 0) {
+        } else if (near && (farCandidateAt == 0 || authoritativeRaw)) {
+            // The reliable RAW FAR can clear the UI quickly; a standard FAR
+            // must be stable longer to reject vendor transition glitches.
             farCandidateAt = SystemClock.elapsedRealtime();
-            main.postDelayed(confirmFar, FAR_CONFIRM_MS);
+            farDelayMs = authoritativeRaw ? 120L : FAR_CONFIRM_MS;
+            main.removeCallbacks(confirmFar);
+            main.postDelayed(confirmFar, farDelayMs);
         }
     }
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) {}
