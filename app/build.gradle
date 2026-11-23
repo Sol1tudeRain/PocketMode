@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 8
-        versionName '0.8-modern-target-sdk'
+        versionCode 9
+        versionName '0.9-navigation-touch-proximity'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
