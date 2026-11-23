@@ -56,6 +56,8 @@ final class CrPocketController {
     // TYPE_SYSTEM_ERROR is a privileged *touchable* layer above the nav bar.
     private static final int TYPE_SYSTEM_ERROR = 2010;
     private static final int DISABLE_USER_ACTIVITY_INPUT = 2;
+    private static final int DISABLE_EXPAND = 0x00010000;
+    private static final int DISABLE2_QS_AND_SHADE = 0x5;
 
     private final Context systemContext;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -72,7 +74,38 @@ final class CrPocketController {
     private boolean interactive;
     private volatile boolean overlayShowing;
     private View overlay;
+    private Object statusBarManager;
+    private boolean statusBarRestricted;
     private long lastSensorTimestampNanos;
+
+    private void disableShadeWhileBlocked() {
+        try {
+            if (statusBarManager == null)
+                statusBarManager = systemContext.getSystemService("statusbar");
+            if (statusBarManager == null) {
+                Log.w(TAG, "StatusBarManager unavailable; overlay still intercepts touches");
+                return;
+            }
+            XposedHelpers.callMethod(statusBarManager, "disable", DISABLE_EXPAND);
+            XposedHelpers.callMethod(statusBarManager, "disable2",
+                    DISABLE2_QS_AND_SHADE);
+            statusBarRestricted = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not disable shade; relying on input window", t);
+            restoreSystemBars();
+        }
+    }
+
+    private void restoreSystemBars() {
+        if (statusBarManager == null) return;
+        try {
+            XposedHelpers.callMethod(statusBarManager, "disable", 0);
+            XposedHelpers.callMethod(statusBarManager, "disable2", 0);
+            statusBarRestricted = false;
+        } catch (Throwable t) {
+            Log.e(TAG, "Could not restore status bar state", t);
+        }
+    }
 
     private final Runnable showIfStillNear = () -> {
         if (enabled && interactive && near && !overrideUntilFar
@@ -310,10 +343,12 @@ final class CrPocketController {
             windowManager.addView(blocker, params);
             overlay = blocker;
             overlayShowing = true;
+            disableShadeWhileBlocked();
             Log.i(TAG, "Framework touch-blocking overlay attached, type=" + params.type
                     + ", flags=0x" + Integer.toHexString(params.flags));
         } catch (Throwable t) {
             Log.e(TAG, "Framework overlay creation failed; fail open", t);
+            restoreSystemBars();
             // Do not keep showing/retrying on a failed or permission-denied ROM.
             overrideUntilFar = true;
         }
@@ -326,6 +361,7 @@ final class CrPocketController {
             windowManager.removeViewImmediate(existing);
             overlay = null;
             overlayShowing = false;
+            restoreSystemBars();
             Log.i(TAG, "Framework pocket overlay removed");
         } catch (Throwable t) {
             // Retain the visibility flag so long POWER can retry dismissal
