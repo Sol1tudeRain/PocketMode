@@ -5,6 +5,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.ContentObserver;
+import android.hardware.display.DisplayManager;
+import android.view.Display;
+import java.util.List;
 import android.graphics.PixelFormat;
 import android.view.MotionEvent;
 import android.widget.FrameLayout;
@@ -33,7 +36,10 @@ final class PocketController implements SensorEventListener {
             Uri.parse("content://org.pocketguard.lsp.config/settings");
     private static final long CONFIRM_MS = 120;
     private static final long HEARTBEAT_MS = 3000;
-    private static final long FAR_CONFIRM_MS = 100;
+    private static final long FAR_CONFIRM_MS = 700;
+    private static final int RAW_TYPE = 33171005;
+    private static final long RAW_PRIORITY_MS = 2500;
+    private static final String BOOT_COUNT = "boot_count";
     private static final int INPUT_FEATURE_DISABLE_USER_ACTIVITY = 2;
     private static final long TEST_MS = 5000;
     // Navigation-bar panel is above the normal status/notification and navigation
@@ -47,6 +53,16 @@ final class PocketController implements SensorEventListener {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final SensorManager sm;
     private final Sensor prox;
+    private final Sensor wakeupProx;
+    private final Sensor rawProx;
+    private final DisplayManager dm;
+    private int displayState = Display.STATE_UNKNOWN;
+    private boolean rawListening;
+    private boolean wakeListening;
+    private boolean fallbackListening;
+    private long lastRawSample;
+    private long lastSleepRequest;
+    private long lastGuardPublished = Long.MIN_VALUE;
     private final WindowManager wm;
     private final PowerManager pm;
 
@@ -64,9 +80,12 @@ final class PocketController implements SensorEventListener {
     private boolean statusBarRestricted;
     private long farCandidateAt;
     private final Runnable confirmFar = () -> {
-        if (near || !enabled) return;
+        if (!near || !enabled || farCandidateAt == 0) return;
         long delay = SystemClock.elapsedRealtime() - farCandidateAt;
-        Log.i(TAG, "Confirmed proximity FAR; release overlay after " + delay + "ms");
+        if (delay < FAR_CONFIRM_MS) return;
+        near = false;
+        farCandidateAt = 0;
+        Log.i(TAG, "Confirmed proximity FAR after " + delay + "ms");
         releaseNearState();
     };
 
@@ -109,6 +128,7 @@ final class PocketController implements SensorEventListener {
         pendingPowerChallenge = 0;
         verifiedPowerChallenge = 0;
         if (!testWindow) hide();
+        publishNearGuard();
     }
 
     private final class TouchBlocker extends FrameLayout {
@@ -170,13 +190,28 @@ final class PocketController implements SensorEventListener {
         context = ctx;
         sm = (SensorManager) ctx.getSystemService(Context.SENSOR_SERVICE);
         prox = sm == null ? null : sm.getDefaultSensor(Sensor.TYPE_PROXIMITY);
+        wakeupProx = sm == null ? null : sm.getDefaultSensor(Sensor.TYPE_PROXIMITY, true);
+        rawProx = findRawProximity(sm);
+        dm = (DisplayManager) ctx.getSystemService(Context.DISPLAY_SERVICE);
         wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
         pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
     }
 
     void init() {
-        Log.i(TAG, "Controller initializing; proximity=" +
-                (prox == null ? "ABSENT" : prox.getName()));
+        Log.i(TAG, "Controller initializing; standard=" +
+                (prox == null ? "ABSENT" : prox.getName()) +
+                " wakeup=" + (wakeupProx == null ? "ABSENT" : wakeupProx.getName()) +
+                " raw=" + (rawProx == null ? "ABSENT" : rawProx.getName()));
+        if (dm != null) {
+            dm.registerDisplayListener(new DisplayManager.DisplayListener() {
+                @Override public void onDisplayAdded(int id) { }
+                @Override public void onDisplayRemoved(int id) { }
+                @Override public void onDisplayChanged(int id) {
+                    if (id == Display.DEFAULT_DISPLAY) syncDisplayState();
+                }
+            }, main);
+        }
+        syncDisplayState();
 
         context.getContentResolver().registerContentObserver(
                 CONFIG_URI, false, new ContentObserver(main) {
@@ -210,13 +245,15 @@ final class PocketController implements SensorEventListener {
                     String action = i.getAction();
                     if (Intent.ACTION_SCREEN_OFF.equals(action)) {
                         if (!testWindow) hide();
+                        syncDisplayState();
+                        main.postDelayed(PocketController.this::syncDisplayState, 100);
                     } else if (Intent.ACTION_USER_UNLOCKED.equals(action)) {
                         refreshConfig();
                     } else if (Intent.ACTION_SCREEN_ON.equals(action)
                             || Intent.ACTION_USER_PRESENT.equals(action)) {
-                        if (near) {
-                            schedule();
-                        }
+                        syncDisplayState();
+                        main.postDelayed(PocketController.this::syncDisplayState, 100);
+                        if (near) schedule();
                     }
                 }
             }, filter, Context.RECEIVER_NOT_EXPORTED);
@@ -250,18 +287,22 @@ final class PocketController implements SensorEventListener {
             if (!wanted) {
                 enabled = false;
                 if (sm != null) sm.unregisterListener(this);
+                rawListening = wakeListening = fallbackListening = false;
                 near = false;
                 bypass = false;
                 pendingPowerChallenge = 0;
                 verifiedPowerChallenge = 0;
                 if (!testWindow) hide();
+                publishNearGuard();
                 Log.i(TAG, "Pocket protection disabled via UI");
-            } else if (sm == null || prox == null) {
+            } else if (sm == null || (prox == null && rawProx == null && wakeupProx == null)) {
                 Log.e(TAG, "No proximity sensor available");
             } else {
-                enabled = sm.registerListener(
-                        this, prox, SensorManager.SENSOR_DELAY_FASTEST, main);
-                Log.i(TAG, "Pocket protection enabled=" + enabled + " (default ON)");
+                enabled = true;
+                syncDisplayState();
+                updateSensors();
+                publishNearGuard();
+                Log.i(TAG, "Pocket protection enabled (RAW preferred)");
             }
         }
 
@@ -277,7 +318,7 @@ final class PocketController implements SensorEventListener {
     }
 
     private void onPowerExitRequest() {
-        if (overlay == null || testWindow) return;
+        if (!enabled || !near || testWindow) return;
         try {
             long now = SystemClock.elapsedRealtime();
             long exit = Settings.Global.getLong(context.getContentResolver(),
@@ -285,6 +326,7 @@ final class PocketController implements SensorEventListener {
             if (exit > 0 && exit <= now && now - exit < 8000) {
                 Log.i(TAG, "Long POWER exit acknowledged: bypass until proximity FAR");
                 bypass = true;
+                publishNearGuard();
                 hide();
             }
         } catch (Throwable t) {
@@ -330,33 +372,149 @@ final class PocketController implements SensorEventListener {
             verifiedPowerChallenge = response;
             lastPowerProofAt = SystemClock.elapsedRealtime();
             Log.i(TAG, "Live system_server POWER escape verified");
-            if (enabled && near && !bypass) schedule();
+            if (enabled && near && !bypass) {
+                publishNearGuard();
+                schedule();
+            }
         } catch (Throwable t) {
             Log.e(TAG, "Power escape acknowledgement invalid", t);
         }
     }
 
-    @Override public void onSensorChanged(SensorEvent event) {
-        if (!enabled || event.sensor.getType() != Sensor.TYPE_PROXIMITY
-                || event.values == null || event.values.length == 0) return;
-        lastSensorEventElapsed = SystemClock.elapsedRealtime();
-        boolean nextNear = event.values[0] < event.sensor.getMaximumRange();
-        if (nextNear == near) return;
-        near = nextNear;
-        long sensorEventAgeMs =
-                (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1000000L;
-        Log.i(TAG, "Proximity NEAR=" + near +
-                " distance=" + event.values[0] +
-                " sensorEventAgeMs=" + sensorEventAgeMs +
-                " overlayAgeMs=" + (overlay == null ? -1
-                        : lastSensorEventElapsed - overlayShownElapsed));
-        if (near) {
-            main.removeCallbacks(confirmFar);
+    /** Locate the device's TCS3720ALSPRX streaming sensor; 0x41b is a handle, not its type. */
+    private static Sensor findRawProximity(SensorManager manager) {
+        if (manager == null) return null;
+        List<Sensor> sensors = manager.getSensorList(Sensor.TYPE_ALL);
+        for (Sensor s : sensors) {
+            if (s.getType() == RAW_TYPE
+                    && s.getName().contains("TCS3720ALSPRX")
+                    && !s.isWakeUpSensor()) return s;
+        }
+        return null;
+    }
+
+    private void syncDisplayState() {
+        Display d = dm == null ? null : dm.getDisplay(Display.DEFAULT_DISPLAY);
+        int state = d == null ? Display.STATE_UNKNOWN : d.getState();
+        if (displayState == state) return;
+        displayState = state;
+        Log.i(TAG, "DISPLAY=" + state);
+        updateSensors();
+        if (state == Display.STATE_OFF || state == Display.STATE_DOZE
+                || state == Display.STATE_DOZE_SUSPEND) {
+            if (!testWindow) hide();
+        } else if (state == Display.STATE_ON && near && !bypass) {
             schedule();
-        } else {
-            // Ignore short FAR/NEAR oscillations caused by sensor noise.
-            farCandidateAt = SystemClock.elapsedRealtime();
+        }
+    }
+
+    private void updateSensors() {
+        if (sm == null) return;
+        if (!enabled) {
+            sm.unregisterListener(this);
+            rawListening = wakeListening = fallbackListening = false;
+            return;
+        }
+        boolean rawWanted = rawProx != null && displayState != Display.STATE_OFF
+                && displayState != Display.STATE_DOZE_SUSPEND;
+        if (rawListening && !rawWanted) {
+            sm.unregisterListener(this, rawProx);
+            rawListening = false;
+            lastRawSample = 0;
+        }
+        if (rawWanted && !rawListening) {
+            rawListening = sm.registerListener(this, rawProx, 200000, main);
+        }
+        // Wake-up proximity remains registered when fully OFF, allowing
+        // movement in and out of a pocket without a continuously active CPU.
+        if (wakeupProx != null && !wakeListening) {
+            wakeListening = sm.registerListener(this, wakeupProx,
+                    SensorManager.SENSOR_DELAY_NORMAL, main);
+        }
+        if (!rawListening && !wakeListening && prox != null && !fallbackListening) {
+            fallbackListening = sm.registerListener(this, prox,
+                    SensorManager.SENSOR_DELAY_NORMAL, main);
+        } else if ((rawListening || wakeListening) && fallbackListening) {
+            sm.unregisterListener(this, prox);
+            fallbackListening = false;
+        }
+        Log.i(TAG, "SENSORS raw=" + rawListening + " wake=" + wakeListening
+                + " fallback=" + fallbackListening);
+    }
+
+    /** Publish only a boot-scoped state, never a stale heartbeat across reboot. */
+    private void publishNearGuard() {
+        try {
+            int boot = Settings.Global.getInt(context.getContentResolver(), BOOT_COUNT, -1);
+            if (boot < 0) return;
+            // A missing live power hook MUST NOT cause a persistent black screen.
+            boolean armed = enabled && near && !bypass
+                    && verifiedPowerChallenge != 0
+                    && verifiedPowerChallenge == pendingPowerChallenge;
+            long encoded = ((long)boot << 1) | (armed ? 1L : 0L);
+            if (encoded == lastGuardPublished) return;
+            if (Settings.Global.putLong(context.getContentResolver(),
+                    PocketPowerHook.PROX_GUARD, encoded)) {
+                lastGuardPublished = encoded;
+                Log.i(TAG, "Wake guard=" + armed + " boot=" + boot);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Cannot publish pocket wake guard; fail open", t);
+        }
+    }
+
+    /** Keep display dark; show the overlay only if ROM denies sleep. */
+    private boolean requestSleep() {
+        if (pm == null || !pm.isInteractive()) return true;
+        long now = SystemClock.uptimeMillis();
+        if (now - lastSleepRequest < 1200) return true;
+        lastSleepRequest = now;
+        try {
+            XposedHelpers.callMethod(pm, "goToSleep", now);
+            Log.i(TAG, "Near: requested screen sleep rather than opening pocket overlay");
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "PowerManager.goToSleep unavailable; overlay fallback", t);
+            return false;
+        }
+    }
+
+    @Override public void onSensorChanged(SensorEvent event) {
+        if (!enabled || event.values == null || event.values.length == 0) return;
+        boolean nextNear;
+        boolean authoritativeRaw = false;
+        if (rawListening && event.sensor == rawProx) {
+            if (event.values.length < 2) return;
+            float a = event.values[0], b = event.values[1];
+            if (!Float.isFinite(a) || !Float.isFinite(b)) return;
+            if (a >= 800f && b >= 800f) nextNear = true;
+            else if (a <= 200f && b <= 200f) nextNear = false;
+            else return; // hysteresis between thresholds
+            lastRawSample = SystemClock.elapsedRealtime();
+            authoritativeRaw = true;
+        } else if ((wakeListening && event.sensor == wakeupProx)
+                || (fallbackListening && event.sensor == prox)) {
+            // Standard proximity may falsely return FAR immediately on wake.
+            // Prefer a recent two-channel RAW reading whenever available.
+            if (rawListening && SystemClock.elapsedRealtime() - lastRawSample
+                    <= RAW_PRIORITY_MS) return;
+            nextNear = event.values[0] < event.sensor.getMaximumRange();
+        } else return;
+        lastSensorEventElapsed = SystemClock.elapsedRealtime();
+        if (nextNear) {
             main.removeCallbacks(confirmFar);
+            farCandidateAt = 0;
+            if (!near) {
+                near = true;
+                Log.i(TAG, "Proximity NEAR via " +
+                        (authoritativeRaw ? "RAW" : "wakeup/fallback"));
+                // Challenge-response proves system_server can release POWER.
+                if (verifiedPowerChallenge == 0) powerEscapeReady();
+                publishNearGuard();
+                schedule();
+            }
+        } else if (near && farCandidateAt == 0) {
+            farCandidateAt = SystemClock.elapsedRealtime();
             main.postDelayed(confirmFar, FAR_CONFIRM_MS);
         }
     }
@@ -376,7 +534,8 @@ final class PocketController implements SensorEventListener {
         if (!enabled || !near || bypass || overlay != null) return;
         if (pm == null || !pm.isInteractive()) return;
         if (!powerEscapeReady()) return;
-        showOverlay(false);
+        publishNearGuard();
+        if (!requestSleep()) showOverlay(false);
     }
 
     private void showOverlay(boolean test) {
