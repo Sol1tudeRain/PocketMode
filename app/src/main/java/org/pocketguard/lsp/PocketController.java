@@ -61,6 +61,7 @@ final class PocketController implements SensorEventListener {
     private boolean wakeListening;
     private boolean fallbackListening;
     private long lastRawSample;
+    private boolean rawConfirmedNear;
     private long lastGuardPublished = Long.MIN_VALUE;
     private final WindowManager wm;
     private final PowerManager pm;
@@ -84,6 +85,7 @@ final class PocketController implements SensorEventListener {
         if (delay < FAR_CONFIRM_MS) return;
         near = false;
         farCandidateAt = 0;
+        rawConfirmedNear = false;
         Log.i(TAG, "Confirmed proximity FAR after " + delay + "ms");
         releaseNearState();
     };
@@ -302,6 +304,7 @@ final class PocketController implements SensorEventListener {
                 if (sm != null) sm.unregisterListener(this);
                 rawListening = wakeListening = fallbackListening = false;
                 near = false;
+                rawConfirmedNear = false;
                 bypass = false;
                 pendingPowerChallenge = 0;
                 verifiedPowerChallenge = 0;
@@ -490,6 +493,9 @@ final class PocketController implements SensorEventListener {
             else return; // hysteresis between thresholds
             lastRawSample = SystemClock.elapsedRealtime();
             authoritativeRaw = true;
+            // RAW channel is reliable across OFF/ON, unlike vendor standard
+            // proximity which can misreport FAR=5 while still covered.
+            rawConfirmedNear = nextNear;
         } else if ((wakeListening && event.sensor == wakeupProx)
                 || (fallbackListening && event.sensor == prox)) {
             // Standard proximity may falsely return FAR immediately on wake.
@@ -497,6 +503,13 @@ final class PocketController implements SensorEventListener {
             if (rawListening && SystemClock.elapsedRealtime() - lastRawSample
                     <= RAW_PRIORITY_MS) return;
             nextNear = event.values[0] < event.sensor.getMaximumRange();
+            if (!nextNear && rawConfirmedNear) {
+                // An OFF-state standard FAR event must not discard a
+                // preattached overlay supported by the trustworthy RAW sensor.
+                // RAW will be sampled again as soon as the panel becomes ON.
+                Log.d(TAG, "Ignoring standard FAR while RAW NEAR latch is armed");
+                return;
+            }
         } else return;
         lastSensorEventElapsed = SystemClock.elapsedRealtime();
         if (nextNear) {
