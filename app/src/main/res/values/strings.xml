@@ -5,5 +5,5 @@
     <string name="pocket_mode_instructions_header">如需使用您的手机：</string>
     <string name="pocket_mode_instruction_step1">1. 确保蓝色区域（距离传感器）不受遮挡。</string>
     <string name="pocket_mode_instruction_step2">2. 移开遮挡，或长按电源键退出；遮罩不会自动超时。</string>
-    <string-array name="xposed_scope"><item>com.android.systemui</item><item>android</item></string-array>
+    <string-array name="xposed_scope"><item>android</item></string-array>
 </resources>
