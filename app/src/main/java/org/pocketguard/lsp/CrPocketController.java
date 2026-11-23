@@ -79,6 +79,9 @@ final class CrPocketController {
     private boolean staleProbeAttempted;
     private boolean enabled;
     private boolean listening;
+    // Sensor callbacks are delivered on the sensor thread, while all
+    // lifecycle changes are serialized through the window UI handler.
+    private volatile int sensorGeneration;
     private boolean near;
     private volatile boolean overrideUntilFar;
     private boolean interactive;
@@ -88,7 +91,8 @@ final class CrPocketController {
     private boolean statusBarRestricted;
     private long lastSensorTimestampNanos;
     private final Runnable staleSensorProbe = () -> {
-        if (!enabled || !near || !overlayShowing || staleProbeAttempted) return;
+        if (!enabled || !interactive || !listening || !near
+                || !overlayShowing || staleProbeAttempted) return;
         long idle = SystemClock.elapsedRealtime() - lastSensorReadingElapsed;
         if (idle >= STALE_SENSOR_PROBE_MS) {
             staleProbeAttempted = true;
@@ -149,11 +153,12 @@ final class CrPocketController {
             final long now = SystemClock.elapsedRealtime();
             final float distance = event.values[0];
             final long eventTimestamp = event.timestamp;
+            final int sourceGeneration = sensorGeneration;
             main.post(() -> {
-                // Keep sensor state fresh while the screen is OFF, exactly as
-                // crDroid's PocketService does. Only the UI overlay is gated
-                // by whether the device is interactive.
-                if (!enabled || !listening) return;
+                // Do not read sensors while the display is off. In-flight
+                // events from the previous registration are also discarded.
+                if (!enabled || !interactive || !listening
+                        || sourceGeneration != sensorGeneration) return;
                 if (eventTimestamp > 0 && lastSensorTimestampNanos > eventTimestamp)
                     return;
                 lastSensorTimestampNanos = eventTimestamp;
@@ -218,24 +223,20 @@ final class CrPocketController {
                     if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) {
                         interactive = false;
                         main.removeCallbacks(showIfStillNear);
+                        // Dismiss and dispose native input monitoring first,
+                        // then fully unregister proximity to save standby power.
                         hideOverlay();
-                        // Deliberately do NOT unregister here: crDroid listens
-                        // during screen-off, so pocket state is ready on wake.
+                        unregisterSensor(true);
+                        Log.i(TAG, "SCREEN_OFF: proximity listener stopped");
                     } else if (Intent.ACTION_SCREEN_ON.equals(intent.getAction())) {
                         interactive = true;
                         if (!enabled) return;
-                        if (!listening) registerSensor();
-                        if (proximity.isWakeUpSensor()) {
-                            // Wake-up proximity stays up to date during sleep.
-                            if (near) scheduleShow();
-                        } else {
-                            // Non-wakeup sensor events can be stale across
-                            // suspend. Re-arm ONCE per wake for a fresh sample,
-                            // not every 1.5 seconds as the old implementation.
-                            unregisterSensor(false);
-                            near = false; // require a fresh sensor value after screen wake
-                            registerSensor();
-                        }
+                        // A screen wake caused by touch, POWER or a notification
+                        // that actually wakes the display requests a fresh
+                        // proximity sample. A silent FCM push does not.
+                        unregisterSensor(true);
+                        registerSensor();
+                        Log.i(TAG, "SCREEN_ON: requested fresh proximity reading");
                     }
                 }
             }, screenFilter, null, main, Context.RECEIVER_NOT_EXPORTED);
@@ -248,7 +249,7 @@ final class CrPocketController {
         // A one-shot post-boot retry keeps first-install default ON without
         // introducing background polling.
         main.postDelayed(this::refreshEnabled, 15000);
-        Log.i(TAG, "crDroid-style framework pocket controller ready, sensor="
+        Log.i(TAG, "Framework pocket controller ready, on-demand sensor="
                 + proximity.getName() + ", wakeup=" + proximity.isWakeUpSensor());
     }
 
@@ -268,26 +269,31 @@ final class CrPocketController {
         boolean wanted = state.getBoolean("enabled", true);
         if (wanted == enabled) return;
         enabled = wanted;
-        if (enabled) {
-            // CrDroid listens while the screen is OFF; extended to ON for
-            // user-requested unlocked-screen pocket protection.
+        if (enabled && interactive) {
             registerSensor();
-            if (interactive && near) scheduleShow();
+            if (near) scheduleShow();
         } else {
-            unregisterSensor(true);
+            // Enabled but fully screen-off is deliberately sensor-idle.
             hideOverlay();
+            unregisterSensor(true);
         }
-        Log.i(TAG, "PocketMode enabled=" + enabled);
+        Log.i(TAG, "PocketMode enabled=" + enabled
+                + " screenInteractive=" + interactive
+                + " sensorListening=" + listening);
     }
 
     private void registerSensor() {
-        if (listening || sensorManager == null || sensorHandler == null) return;
-        // The crDroid service runs sensors on a dedicated HandlerThread.
-        // No repeated unregister/re-register in a timer.
+        if (!enabled || !interactive || listening
+                || sensorManager == null || sensorHandler == null) return;
+        // Only register while the actual screen is interactive. The initial
+        // value from the on-change proximity sensor gates the overlay.
+        // A DOZE/AOD pulse that does not wake the screen does not trigger
+        // a full sensor registration in this version.
+        ++sensorGeneration;
         boolean ok = sensorManager.registerListener(proximityListener,
                 proximity, PROXIMITY_RATE_US, sensorHandler);
         listening = ok;
-        if (!ok) Log.e(TAG, "Cannot register proximity listener; overlay disabled");
+        if (!ok) Log.e(TAG, "Cannot register proximity listener on wake");
     }
 
     private void unregisterSensor() {
@@ -295,6 +301,7 @@ final class CrPocketController {
     }
 
     private void unregisterSensor(boolean clearState) {
+        ++sensorGeneration; // invalidate callbacks queued from prior sessions
         if (listening && sensorManager != null) {
             listening = false;
             sensorManager.unregisterListener(proximityListener);
