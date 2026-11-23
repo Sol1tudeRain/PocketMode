@@ -47,8 +47,9 @@ final class PocketInputShield {
         inputThread.start();
         input = new Handler(inputThread.getLooper());
         try {
-            // Hook the base class once. Our receiver is an exact instance of
-            // InputEventReceiver, whose default onInputEvent finishes events.
+            // Hook the inherited base method. Our receiver is a *concrete*
+            // BatchedInputEventReceiver; Android 17's InputEventReceiver
+            // itself is abstract and cannot be instantiated.
             // Other input receivers are never modified by this callback.
             Class<?> cls = XposedHelpers.findClass(
                     "android.view.InputEventReceiver", null);
@@ -103,13 +104,25 @@ final class PocketInputShield {
                     Object createdReceiver = null;
                     try {
                         Object channel = XposedHelpers.callMethod(created, "getInputChannel");
+                        // InputEventReceiver is abstract on Android 17.
+                        // BatchedInputEventReceiver is concrete and inherits
+                        // its base onInputEvent(), which acknowledges events.
                         Class<?> receiverClass = XposedHelpers.findClass(
-                                "android.view.InputEventReceiver", null);
+                                "android.view.BatchedInputEventReceiver", null);
+                        Object choreographer = XposedHelpers.callStaticMethod(
+                                XposedHelpers.findClass("android.view.Choreographer", null),
+                                "getInstance");
+                        if (choreographer == null)
+                            throw new IllegalStateException("Input Choreographer unavailable");
                         createdReceiver = XposedHelpers.newInstance(
-                                receiverClass, channel, Looper.myLooper());
+                                receiverClass, channel, Looper.myLooper(), choreographer);
+                        // Deliver DOWN immediately rather than waiting for
+                        // frame batching: gesture handlers can act before us.
+                        XposedHelpers.callMethod(
+                                createdReceiver, "setBatchingEnabled", false);
                         monitor = created;
                         receiver = createdReceiver;
-                        Log.i(TAG, "Native gesture input monitor armed");
+                        Log.i(TAG, "Concrete BatchedInputEventReceiver armed (unbatched)");
                     } catch (Throwable t) {
                         if (createdReceiver != null) {
                             try { XposedHelpers.callMethod(createdReceiver, "dispose"); }
