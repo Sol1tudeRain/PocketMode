@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 32
-        versionCode 3
-        versionName '0.3-all-screens'
+        versionCode 4
+        versionName '0.4-settings-whitelist'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
