@@ -143,13 +143,18 @@ public final class PocketPowerHook {
                     CrPocketController c = controller;
                     Object original = p.args[1];
                     if ((int) p.args[0] != Display.DEFAULT_DISPLAY || c == null
-                            || !c.isManualWake() || original == null) return;
+                            || !c.canCheckPowerWake() || original == null) return;
+                    boolean manual = c.isManualWake();
+                    Context ctx = (Context) XposedHelpers.getObjectField(p.thisObject, "mContext");
+                    if (!manual && ctx.getSystemService(PowerManager.class).isInteractive()) return;
                     p.args[1] = Proxy.newProxyInstance(listenerType.getClassLoader(),
                             new Class<?>[]{listenerType}, (proxy, method, args) -> {
                                 if (!method.getName().equals("onScreenOn"))
                                     return method.invoke(original, args);
-                                c.whenScreenReady(() -> handler.post(() ->
-                                        XposedHelpers.callMethod(original, "onScreenOn")));
+                                Runnable unblock = () -> handler.post(() ->
+                                        XposedHelpers.callMethod(original, "onScreenOn"));
+                                if (manual) c.whenScreenReady(unblock);
+                                else c.whenAmbientReady(unblock);
                                 return null;
                             });
                 }

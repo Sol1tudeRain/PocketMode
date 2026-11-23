@@ -60,6 +60,8 @@ final class CrPocketController {
     private PowerManager.WakeLock probeLock;
     private boolean waitingForFrame;
     private Runnable screenReady;
+    private Runnable ambientReady;
+    private boolean ambientSleepRequested;
     private Runnable wakeTimeout;
     private volatile boolean manualWake;
     private boolean frameReady;
@@ -112,7 +114,7 @@ final class CrPocketController {
                 + " source=" + source + " displayState=" + displayState);
         if (near) {
             if (isAmbient() && !manualWake) {
-                sleepAmbient();
+                if (ambientReady == null) sleepAmbient();
                 return;
             }
             main.removeCallbacks(showIfStillNear);
@@ -133,7 +135,7 @@ final class CrPocketController {
             final float a = event.values[0];
             final float b = event.values.length > 1 ? event.values[1] : Float.NaN;
             main.post(() -> {
-                if (!enabled || (!displayLit && !manualWake) || !listening || epoch != sensorEpoch)
+                if (!enabled || (!displayLit && !manualWake && ambientReady == null) || !listening || epoch != sensorEpoch)
                     return;
                 if (type == RAW_TYPE) {
                     if (!rawListening || Float.isNaN(b)) return;
@@ -155,6 +157,7 @@ final class CrPocketController {
                         rawDecisive = true;
                         updateNear(rawNear, "RAW adc0=" + a + " adc1=" + b);
                         if (manualWake) decidePowerWake(rawNear);
+                        else decideAmbient(rawNear);
                     }
                 } else if (!rawListening || !rawDecisive) {
                     // Fallback only until the factory ADC provides a
@@ -164,6 +167,7 @@ final class CrPocketController {
                     if (!manualWake || !rawListening) {
                         updateNear(standardCovered, "STANDARD distance=" + a);
                         if (manualWake) decidePowerWake(standardCovered);
+                        else if (!rawListening) decideAmbient(standardCovered);
                     }
                 }
             });
@@ -262,6 +266,7 @@ final class CrPocketController {
             if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
             releaseScreen();
         }
+        if (nextState == Display.STATE_OFF) finishAmbient();
         displayState = nextState;
         displayLit = isLit(nextState);
         Log.i(TAG, "Display state=" + nextState + " lit=" + displayLit);
@@ -269,11 +274,12 @@ final class CrPocketController {
     }
 
     private void applySensorState() {
-        if (!enabled || (!displayLit && !manualWake)) {
+        if (!enabled || (!displayLit && !manualWake && ambientReady == null)) {
             main.removeCallbacks(showIfStillNear);
             hideOverlay();
             stopSensor();
             if (!enabled) {
+                finishAmbient();
                 manualWake = false;
                 resumeWake();
                 releaseScreen();
@@ -328,6 +334,7 @@ final class CrPocketController {
                 return;
             }
             manualWake = true;
+            finishAmbient();
             pendingWake = wake;
             // POWER-up may release the policy wake lock before the RAW sample arrives.
             // A partial lock runs the probe without lighting the panel.
@@ -380,6 +387,49 @@ final class CrPocketController {
         if (wake != null) wake.run();
         // The bounded lock bridges the queued policy callback as well as sampling.
 
+    }
+
+    // The display policy can ask to unblock the first AOD frame before
+    // DisplayManager publishes DOZE. Sample while that callback is pending.
+    void whenAmbientReady(Runnable unblock) {
+        main.post(() -> {
+            finishAmbient();
+            PowerManager pm = systemContext.getSystemService(PowerManager.class);
+            if (!enabled || manualWake || bypassUntilFar || pm == null || pm.isInteractive()) {
+                unblock.run();
+                return;
+            }
+            ambientReady = unblock;
+            ambientSleepRequested = false;
+            startSensor();
+            main.postDelayed(ambientDeadline, 850);
+            if (rawDecisive || (!rawListening && standardSample)) decideAmbient(near);
+        });
+    }
+
+    private final Runnable ambientDeadline = () -> {
+        finishAmbient();
+        if (!displayLit && !manualWake) applySensorState();
+    };
+
+    private void decideAmbient(boolean covered) {
+        if (ambientReady == null) return;
+        if (!covered) {
+            finishAmbient();
+        } else if (!ambientSleepRequested) {
+            ambientSleepRequested = true;
+            sleepAmbient();
+        }
+    }
+
+    private void finishAmbient() {
+        main.removeCallbacks(ambientDeadline);
+        Runnable callback = ambientReady;
+        ambientReady = null;
+        if (callback != null) {
+            callback.run();
+            if (!displayLit && !manualWake) stopSensor();
+        }
     }
 
     void whenScreenReady(Runnable unblock) {
