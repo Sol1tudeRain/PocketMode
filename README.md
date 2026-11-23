@@ -1,36 +1,66 @@
-# PocketMode — LSPosed for PixelOS Android 17
+# PocketMode v1.1 — experimental crDroid framework port
 
-Pocket protection using a native SystemUI overlay plus a power-key escape hook in Android framework.
+**This is an experimental branch. Do not replace a working v1.0 without
+a recovery route.** The code has not been tested on the target PixelOS 17
+system_server. Injecting code there can destabilize Android if a ROM policy
+is incompatible.
 
-## Settings
+## What changed
 
-Open the **PocketMode** app from the launcher. There is exactly **one master ON/OFF switch**, enabled by default. There is **no application whitelist** and **no foreground-app polling**.
+This implementation is adapted from the architecture of crDroid 17 /
+Paranoid Android:
 
-## Behavior
+- `services/core/java/com/android/server/pocket/PocketService.java`
+  uses a `HandlerThread` for sensor state. Our
+  `CrPocketController.java` likewise separates sensor delivery from
+  the window UI thread and requests proximity events at 400,000 µs.
+- `services/core/java/com/android/server/policy/pocket/PocketLock.java`
+  adds a `TYPE_SECURE_SYSTEM_OVERLAY` window with
+  `FLAG_WATCH_OUTSIDE_TOUCH`, `FLAG_SHOW_WHEN_LOCKED`,
+  `FLAG_HARDWARE_ACCELERATED`, `FLAG_FULLSCREEN`, and
+  `FLAG_LAYOUT_IN_SCREEN`. Our overlay uses the same window type and flags
+  **inside system_server**, rather than a different SystemUI window layer.
+- `PhoneWindowManager.java` handles pocket visibility and long POWER.
+  The new `PocketPowerHook.java` handles POWER inside the same process as
+  the overlay, without any `Settings.Global` handshake or heartbeat.
+- Customizations: PocketMode also activates when unlocked (crDroid normally
+  limits the interactive display case to the keyguard), uses no UI fade
+  animation, and keeps the single default-on master switch.
+- Touches are consumed by the full-screen window and the hidden
+  `INPUT_FEATURE_DISABLE_USER_ACTIVITY` field is set so touch input
+  should not reset the user's screen timeout.
 
-- Proximity NEAR triggers a full-screen SystemUI overlay, on both the lock screen and unlocked apps.
-- The overlay consumes touches, covers the system navigation bar, and temporarily restricts status bar/quick settings expansion.
-- Touching the overlay does not refresh the normal screen-off timer.
-- Proximity FAR (confirmed after 100 ms) removes the overlay.
-- Long POWER exits the overlay without opening the power menu for that hold.
-- Ordinary short POWER can switch the screen off.
-- No automatic 15-second dismissal on the normal overlay.
-- Doze pulse suppression is attempted when pocket mode is active.
-- Unavailable power-key escape Hook prevents an indefinite overlay from activating, as a fail-safe.
+There is no foreground-app whitelist, no per-700ms polling, no repeated
+sensor re-registration, and no 15-second auto-dismissal of the normal lock.
+Distance FAR removes the overlay immediately; long POWER exits while blocked,
+bypassing until proximity FAR.
 
-## Install
+## Installation
 
-1. Install the signed APK.
-2. In LSPosed enable both **com.android.systemui** (System UI) and **android** (Android system framework / system_server) scopes.
-3. Fully reboot the phone.
-4. Open the PocketMode app to use the master switch.
+1. Keep your current stable APK for recovery.
+2. Install an APK built from this experimental branch.
+3. Set LSPosed scope **only to Android / `android` (system_server)**.
+4. Reboot completely; a SystemUI-only restart cannot load this architecture.
+5. Open the PocketMode app and use its single toggle.
 
-v1.0 is signed with the same certificate as v0.7–v0.9 **fixed-signature** releases, allowing an in-place update from those versions. GitHub Actions uploads unsigned release APKs; they require private signing with the stable key, which is never published in this repository.
+Debug logs: `logcat -d -s PocketModeCr:V PocketModePower:V | tail -n 80`.
 
-## Limitations
+## Safety notes
 
-Experimental Android framework hooking, not fully validated on the target PixelOS Android 17 device. If a SystemUI or system_server issue occurs, disable PocketMode in LSPosed and reboot. Don't use old transient debug-signed APKs as updates to stable-signed releases.
+- This module is not a patch to the ROM's full `android.pocket` framework:
+  PixelOS has no crDroid-specific `PocketService`, manager APIs or internal
+  `pocket_lock_view` resource. It is an LSPosed port of the relevant logic.
+- If the `PhoneWindowManager` power hook cannot be installed, the overlay
+  will not activate. If the secure window type is rejected, the module
+  fails open rather than substituting a lower, potentially touch-through
+  overlay.
+- System emergency hardware key paths are not modified.
+- If boot issues occur, disable the module via LSPosed safe mode / recovery.
 
-## Credits
+## Attribution / license
 
-Pocket UI follows crDroid 17. Phone illustration derived from Paranoid Android (2024, Apache-2.0).
+The original pocket service and view code derives from Paranoid Android
+and crDroid framework components under the **Apache License 2.0**.
+Adapted architecture and window policy in this project are labeled in source.
+
+https://github.com/crdroidandroid/android_frameworks_base/tree/17.0
