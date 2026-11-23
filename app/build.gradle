@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 14
-        versionName '1.4-concrete-input-receiver'
+        versionCode 15
+        versionName '1.5-on-demand-proximity'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
