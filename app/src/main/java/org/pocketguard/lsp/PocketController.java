@@ -62,6 +62,12 @@ final class PocketController implements SensorEventListener {
     private int lastTestSequence = -1;
     private String lastTopPackage = "";
     private boolean warnedTaskFailure;
+    private long pendingPowerChallenge;
+    private long verifiedPowerChallenge;
+    private long lastPowerChallengeAt;
+    private long lastPowerProofAt;
+    private static final long CHALLENGE_RETRY_MS = 4000;
+    private static final long PROOF_TTL_MS = 10000;
 
     private final Runnable showRunnable = () -> {
         pending = false;
@@ -133,6 +139,14 @@ final class PocketController implements SensorEventListener {
                     }
                 });
 
+        context.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(PocketPowerHook.READY_ACK), false,
+                new ContentObserver(main) {
+                    @Override public void onChange(boolean selfChange) {
+                        onPowerProofReceived();
+                    }
+                });
+
         IntentFilter filter = new IntentFilter();
         filter.addAction(Intent.ACTION_SCREEN_ON);
         filter.addAction(Intent.ACTION_SCREEN_OFF);
@@ -192,6 +206,8 @@ final class PocketController implements SensorEventListener {
                 near = false;
                 bypass = false;
                 main.removeCallbacks(foregroundPoll);
+                pendingPowerChallenge = 0;
+                verifiedPowerChallenge = 0;
                 if (!testWindow) hide();
                 Log.i(TAG, "Pocket protection disabled via UI");
             } else if (sm == null || prox == null) {
@@ -238,23 +254,47 @@ final class PocketController implements SensorEventListener {
         }
     }
 
+    /** A fresh challenge proves the POWER hook is running in this system_server. */
     private boolean powerEscapeReady() {
+        long now = SystemClock.elapsedRealtime();
+        if (verifiedPowerChallenge != 0 && verifiedPowerChallenge == pendingPowerChallenge
+                && now >= lastPowerProofAt && now - lastPowerProofAt < PROOF_TTL_MS) {
+            return true;
+        }
+        if (pendingPowerChallenge != 0 && now >= lastPowerChallengeAt
+                && now - lastPowerChallengeAt < CHALLENGE_RETRY_MS) return false;
         try {
-            int boot = Settings.Global.getInt(
-                    context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
-            int readyBoot = Settings.Global.getInt(
-                    context.getContentResolver(), PocketPowerHook.READY_BOOT, -2);
-            long ready = Settings.Global.getLong(
-                    context.getContentResolver(), PocketPowerHook.READY_ELAPSED, 0);
-            long now = SystemClock.elapsedRealtime();
-            boolean ok = boot >= 0 && readyBoot == boot && ready > 0 && ready <= now;
-            if (!ok) {
-                Log.e(TAG, "No confirmed system_server POWER escape, refusing indefinite overlay");
+            long challenge = (SystemClock.elapsedRealtimeNanos() ^ System.nanoTime()
+                    ^ ((long) android.os.Process.myPid() << 32)) & Long.MAX_VALUE;
+            if (challenge == 0) challenge = 1;
+            pendingPowerChallenge = challenge;
+            verifiedPowerChallenge = 0;
+            lastPowerChallengeAt = now;
+            if (!Settings.Global.putLong(context.getContentResolver(),
+                    PocketPowerHook.READY_CHALLENGE, challenge)) {
+                Log.e(TAG, "Could not send power escape challenge");
+                return false;
             }
-            return ok;
-        } catch (Throwable t) {
-            Log.e(TAG, "POWER escape readiness check failed", t);
+            Log.i(TAG, "Requested live system_server POWER escape proof");
             return false;
+        } catch (Throwable t) {
+            Log.e(TAG, "Power escape proof request failed; fail open", t);
+            return false;
+        }
+    }
+
+    private void onPowerProofReceived() {
+        if (pendingPowerChallenge == 0) return;
+        try {
+            long response = Settings.Global.getLong(context.getContentResolver(),
+                    PocketPowerHook.READY_ACK, 0);
+            if (response != pendingPowerChallenge) return;
+            verifiedPowerChallenge = response;
+            lastPowerProofAt = SystemClock.elapsedRealtime();
+            Log.i(TAG, "Live system_server POWER escape verified");
+            if (enabled && near && !bypass && !foregroundWhitelisted) schedule();
+        } catch (Throwable t) {
+            Log.e(TAG, "Power escape acknowledgement invalid", t);
         }
     }
 
@@ -320,6 +360,8 @@ final class PocketController implements SensorEventListener {
             bypass = false;
             foregroundWhitelisted = false;
             main.removeCallbacks(foregroundPoll);
+            pendingPowerChallenge = 0;
+            verifiedPowerChallenge = 0;
             if (!testWindow) hide();
         } else {
             startForegroundPoll();
