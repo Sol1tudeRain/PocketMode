@@ -12,7 +12,7 @@ import android.os.Bundle;
 import android.os.Process;
 
 /**
- * Device-protected, read-only IPC bridge from the module app to SystemUI.
+ * Device-protected configuration shared by the module, system Settings and the hooks.
  * Config writes happen only inside the module app and notify observers.
  */
 public final class ConfigProvider extends ContentProvider {
@@ -24,6 +24,11 @@ public final class ConfigProvider extends ContentProvider {
     public static SharedPreferences preferences(Context c) {
         return c.createDeviceProtectedStorageContext()
                 .getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE);
+    }
+
+    static void setEnabled(Context c, boolean enabled) {
+        preferences(c).edit().putBoolean(KEY_ENABLED, enabled).apply();
+        notifyUpdated(c);
     }
 
     public static void notifyUpdated(Context c) {
@@ -39,18 +44,33 @@ public final class ConfigProvider extends ContentProvider {
         String[] packages = pm.getPackagesForUid(uid);
         if (packages != null) {
             for (String pkg : packages) {
-                if ("com.android.systemui".equals(pkg)) return;
+                if ("com.android.systemui".equals(pkg) || "com.android.settings".equals(pkg)) return;
             }
         }
         throw new SecurityException("PocketMode config may only be read by Android framework");
     }
 
     @Override public Bundle call(String method, String arg, Bundle extras) {
+        if ("set".equals(method)) {
+            try {
+                int settingsUid = getContext().getPackageManager().getPackageUid("com.android.settings", 0);
+                if (Binder.getCallingUid() != settingsUid)
+                    throw new SecurityException("Only system Settings may change pocket protection");
+            } catch (PackageManager.NameNotFoundException e) {
+                throw new SecurityException("Settings unavailable", e);
+            }
+            if (extras == null || !extras.containsKey(KEY_ENABLED))
+                throw new IllegalArgumentException("Missing enabled value");
+            long identity = Binder.clearCallingIdentity();
+            try { setEnabled(getContext(), extras.getBoolean(KEY_ENABLED)); }
+            finally { Binder.restoreCallingIdentity(identity); }
+            return new Bundle();
+        }
         enforceReader();
         if (!"get".equals(method)) throw new IllegalArgumentException("Unknown method");
         SharedPreferences prefs = preferences(getContext());
         Bundle out = new Bundle();
-        // First-install default = ON. The user can turn it off from the launcher UI.
+        // Preserve the enabled-by-default behavior for existing installations.
         out.putBoolean(KEY_ENABLED, prefs.getBoolean(KEY_ENABLED, true));
         return out;
     }

@@ -5,5 +5,5 @@
     <string name="pocket_mode_instructions_header">如需使用您的手机：</string>
     <string name="pocket_mode_instruction_step1">1. 确保蓝色区域（距离传感器）不受遮挡。</string>
     <string name="pocket_mode_instruction_step2">2. 长按电源键 %1$d 秒，可解除本次口袋模式。</string>
-    <string-array name="xposed_scope"><item>android</item><item>com.android.systemui</item></string-array>
+    <string-array name="xposed_scope"><item>android</item><item>com.android.systemui</item><item>com.android.settings</item></string-array>
 </resources>

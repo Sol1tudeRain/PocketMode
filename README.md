@@ -1,7 +1,7 @@
-# PocketMode v2.5
+# PocketMode v2.6
 
-Based on v1.9 for PixelOS. Select Android System Framework (`android`) and System UI (`com.android.systemui`) in
-LSPosed and reboot after installing.
+Based on v1.9 for PixelOS. Select Android System Framework (`android`), System UI (`com.android.systemui`) and Settings (`com.android.settings`) in
+LSPosed and reboot after installing. Toggle PocketMode in System → Gestures or add its Quick Settings tile. Long-press the tile to open Gestures.
 
 System UI samples proximity before a notification pulse. A covered sample suppresses the pulse.
 While the display is off, physical POWER and supported tap-to-wake requests also trigger a proximity check.

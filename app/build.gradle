@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 25
-        versionName '2.5-tap-wake'
+        versionCode 26
+        versionName '2.6-gestures-tile'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
