@@ -1,4 +1,4 @@
-# PocketMode v2.3
+# PocketMode v2.4
 
 Based on v1.9 for PixelOS. Select Android System Framework (`android`) and System UI (`com.android.systemui`) in
 LSPosed and reboot after installing.

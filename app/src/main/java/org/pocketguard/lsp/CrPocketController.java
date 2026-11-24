@@ -570,6 +570,16 @@ final class CrPocketController {
             windowManager.addView(blocker, params);
             overlay = blocker;
             overlayShowing = true;
+            // The new input monitor did not see DOWN for a drag that started
+            // before the pocket window. End that stream while SystemUI can
+            // still handle its CANCEL, then settle the shade before disabling it.
+            try {
+                XposedHelpers.callMethod(systemContext.getSystemService(Context.INPUT_SERVICE),
+                        "cancelCurrentTouch");
+            } catch (Throwable e) {
+                Log.w(TAG, "Could not cancel the pre-pocket touch stream", e);
+            }
+            collapseShade();
             disableShade();
             Log.i(TAG, "Pocket overlay attached displayState=" + displayState);
         } catch (Throwable t) {
@@ -583,6 +593,7 @@ final class CrPocketController {
         ++preparationEpoch;
         frameReady = false;
         preparing = false;
+        boolean hadOverlay = overlay != null;
         overlayShowing = false;
         if (inputShield != null) inputShield.stop();
         if (overlay != null) {
@@ -594,7 +605,23 @@ final class CrPocketController {
                 Log.e(TAG, "Cannot remove pocket overlay", t);
             }
         }
-        restoreShade();
+        if (overlay == null) {
+            restoreShade();
+            // Reconcile a collapse ignored while shade expansion was disabled.
+            // Idle FAR and OFF callbacks must not collapse an unrelated shade.
+            if (hadOverlay) collapseShade();
+        }
+    }
+
+    private void collapseShade() {
+        try {
+            if (statusBarManager == null)
+                statusBarManager = systemContext.getSystemService("statusbar");
+            if (statusBarManager != null)
+                XposedHelpers.callMethod(statusBarManager, "collapsePanels");
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not settle notification shade", t);
+        }
     }
 
     private void disableShade() {
