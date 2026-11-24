@@ -87,12 +87,33 @@ final class CrPocketController {
     private View overlay;
     private Object statusBarManager;
 
-    private final Runnable showIfStillNear = () -> {
+    private int delaySeconds = ConfigProvider.DEFAULT_DELAY;
+    private long nearSince = -1;
+    private boolean timingUnlocked;
+
+    private final Runnable showIfStillNear = this::checkCoverDuration;
+    private void checkCoverDuration() {
         if (enabled && canShow() && near && !bypassUntilFar
                 && PocketPowerHook.isEscapeInstalled()) {
-            requestOverlay();
+            if (overlayShowing || preparing) return;
+            android.app.KeyguardManager keyguard =
+                    systemContext.getSystemService(android.app.KeyguardManager.class);
+            boolean unlocked = displayState == Display.STATE_ON && !isAmbient()
+                    && keyguard != null && !keyguard.isKeyguardLocked();
+            long now = android.os.SystemClock.uptimeMillis();
+            if (nearSince < 0 || timingUnlocked != unlocked) {
+                nearSince = now;
+                timingUnlocked = unlocked;
+            }
+            long due = nearSince + (unlocked ? delaySeconds * 1000L : NEAR_CONFIRM_MS);
+            main.removeCallbacks(showIfStillNear);
+            // Keyguard can change while the physical display stays ON.
+            // Recheck only during a pending hold so locking never inherits
+            // the multi-second unlocked delay.
+            if (now < due) main.postAtTime(showIfStillNear, Math.min(due, now + 120));
+            else requestOverlay();
         }
-    };
+    }
 
     private final DisplayManager.DisplayListener displayListener =
             new DisplayManager.DisplayListener() {
@@ -110,6 +131,7 @@ final class CrPocketController {
     private void updateNear(boolean covered, String source) {
         if (covered == near) return;
         near = covered;
+        nearSince = -1;
         Log.i(TAG, "Proximity " + (near ? "NEAR" : "FAR")
                 + " source=" + source + " displayState=" + displayState);
         if (near) {
@@ -117,7 +139,7 @@ final class CrPocketController {
                 return;
             }
             main.removeCallbacks(showIfStillNear);
-            main.postDelayed(showIfStillNear, NEAR_CONFIRM_MS);
+            checkCoverDuration();
         } else {
             bypassUntilFar = false;
             main.removeCallbacks(showIfStillNear);
@@ -235,6 +257,11 @@ final class CrPocketController {
                     .call(SETTINGS_URI, "get", null, null);
             if (state == null) throw new IllegalStateException("Null settings");
             boolean requested = state.getBoolean("enabled", true);
+            int seconds = state.getInt(ConfigProvider.KEY_DELAY, ConfigProvider.DEFAULT_DELAY);
+            if (seconds != delaySeconds) {
+                delaySeconds = seconds;
+                if (requested && enabled && near) checkCoverDuration();
+            }
             if (requested == enabled) return;
             enabled = requested;
             Log.i(TAG, "Module enabled=" + enabled);
@@ -268,6 +295,7 @@ final class CrPocketController {
             if (wakeTimeout != null) main.removeCallbacks(wakeTimeout);
             releaseScreen();
         }
+        nearSince = -1;
         displayState = nextState;
         displayLit = isLit(nextState);
         Log.i(TAG, "Display state=" + nextState + " lit=" + displayLit);
@@ -466,6 +494,7 @@ final class CrPocketController {
     }
 
     private void stopSensor() {
+        nearSince = -1;
         ++sensorEpoch;
         if (listening) {
             listening = false;

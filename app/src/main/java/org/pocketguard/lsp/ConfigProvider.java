@@ -21,6 +21,10 @@ public final class ConfigProvider extends ContentProvider {
     public static final String PREF_FILE = "pocketmode";
     public static final String KEY_ENABLED = "enabled";
 
+    static final String KEY_DELAY = "unlocked_cover_seconds";
+    static final int DEFAULT_DELAY = 1;
+    static final int MAX_DELAY = 5;
+
     public static SharedPreferences preferences(Context c) {
         return c.createDeviceProtectedStorageContext()
                 .getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE);
@@ -51,7 +55,7 @@ public final class ConfigProvider extends ContentProvider {
     }
 
     @Override public Bundle call(String method, String arg, Bundle extras) {
-        if ("set".equals(method)) {
+        if ("set".equals(method) || "setDelay".equals(method)) {
             try {
                 int settingsUid = getContext().getPackageManager().getPackageUid("com.android.settings", 0);
                 if (Binder.getCallingUid() != settingsUid)
@@ -59,10 +63,20 @@ public final class ConfigProvider extends ContentProvider {
             } catch (PackageManager.NameNotFoundException e) {
                 throw new SecurityException("Settings unavailable", e);
             }
-            if (extras == null || !extras.containsKey(KEY_ENABLED))
-                throw new IllegalArgumentException("Missing enabled value");
+            boolean delay = "setDelay".equals(method);
+            if (extras == null || !extras.containsKey(delay ? KEY_DELAY : KEY_ENABLED))
+                throw new IllegalArgumentException("Missing preference value");
             long identity = Binder.clearCallingIdentity();
-            try { setEnabled(getContext(), extras.getBoolean(KEY_ENABLED)); }
+            try {
+                if (delay) {
+                    int seconds = extras.getInt(KEY_DELAY);
+                    if (seconds < 1 || seconds > MAX_DELAY) throw new IllegalArgumentException("Invalid delay");
+                    preferences(getContext()).edit().putInt(KEY_DELAY, seconds).apply();
+                    notifyUpdated(getContext());
+                } else {
+                    setEnabled(getContext(), extras.getBoolean(KEY_ENABLED));
+                }
+            }
             finally { Binder.restoreCallingIdentity(identity); }
             return new Bundle();
         }
@@ -72,6 +86,7 @@ public final class ConfigProvider extends ContentProvider {
         Bundle out = new Bundle();
         // Preserve the enabled-by-default behavior for existing installations.
         out.putBoolean(KEY_ENABLED, prefs.getBoolean(KEY_ENABLED, true));
+        out.putInt(KEY_DELAY, prefs.getInt(KEY_DELAY, DEFAULT_DELAY));
         return out;
     }
 
