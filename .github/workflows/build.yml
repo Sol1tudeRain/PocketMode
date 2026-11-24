@@ -3,7 +3,7 @@ on:
   push:
     branches: [main, experimental/crdroid-framework-port]
   pull_request:
-    branches: [main]
+    branches: [main, experimental/crdroid-framework-port]
   workflow_dispatch:
 permissions:
   contents: read

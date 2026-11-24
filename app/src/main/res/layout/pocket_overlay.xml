@@ -16,6 +16,6 @@
         android:layout_marginTop="16dp" android:text="@string/pocket_mode_instruction_step1"
         android:textColor="#C0CBD8" android:textSize="15sp"/>
     <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:layout_marginTop="14dp" android:text="@string/pocket_mode_instruction_step2"
+        android:id="@+id/power_hint" android:layout_marginTop="14dp" android:text="@string/pocket_mode_instruction_step2"
         android:textColor="#C0CBD8" android:textSize="15sp"/>
 </LinearLayout>

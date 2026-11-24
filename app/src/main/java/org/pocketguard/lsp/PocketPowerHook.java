@@ -9,6 +9,12 @@ package org.pocketguard.lsp;
 
 import android.content.Context;
 import android.util.Log;
+import android.os.Handler;
+import android.os.PowerManager;
+import android.view.Display;
+import android.view.KeyEvent;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 
 import java.util.Set;
 
@@ -21,13 +27,127 @@ public final class PocketPowerHook {
     private static final String TAG = "PocketModePower";
     private static volatile CrPocketController controller;
     private static volatile boolean escapeInstalled;
-    private static volatile boolean consumeVeryLongUntilKeyUp;
+    static final int HOLD_SECONDS = 3;
+    private static long downTime = -1;
+    private static boolean consumed;
+    private static Handler handler;
+    private static Runnable escape;
+
+    private static synchronized void beginHold(Object policy, KeyEvent event) {
+        if (event.getRepeatCount() != 0 || handler == null) return;
+        endHold();
+        downTime = event.getDownTime();
+        final long press = downTime;
+        escape = () -> {
+            synchronized (PocketPowerHook.class) {
+                CrPocketController c = controller;
+                if (press != downTime || c == null || !c.isOverlayShowing()) return;
+                XposedHelpers.setBooleanField(policy, "mPowerKeyHandled", true);
+                consumed = true;
+                c.exitOnLongPower();
+            }
+        };
+        handler.postAtTime(escape, press + HOLD_SECONDS * 1000L);
+    }
+
+    private static synchronized void endHold() {
+        if (escape != null) handler.removeCallbacks(escape);
+        escape = null;
+        downTime = -1;
+        consumed = false;
+    }
+
+    private static synchronized boolean suppressMenu() {
+        return consumed || (downTime >= 0 && controller != null && controller.isOverlayShowing());
+    }
 
     private PocketPowerHook() { }
 
+    static CrPocketController controller() { return controller; }
+
     static boolean isEscapeInstalled() { return escapeInstalled; }
 
+    private static void installTouchTimeoutHook(ClassLoader loader) {
+        try {
+            Class<?> service = XposedHelpers.findClass(
+                    "com.android.server.power.PowerManagerService", loader);
+            Class<?> group = XposedHelpers.findClass("com.android.server.power.PowerGroup", loader);
+            Method groupId = XposedHelpers.findMethodExact(group, "getGroupId");
+            // PowerManager.USER_ACTIVITY_EVENT_TOUCH and Display.DEFAULT_DISPLAY_GROUP
+            // are hidden SDK constants. The service updates the idle deadline after this point.
+            final int touch = 2;
+            final int defaultGroup = 0;
+            XposedHelpers.findAndHookMethod(service, "userActivityNoUpdateLocked", group,
+                    long.class, int.class, int.class, int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) throws Throwable {
+                    CrPocketController c = controller;
+                    if (c == null || !c.isOverlayShowing() || (int) p.args[2] != touch) return;
+                    if ((int) groupId.invoke(p.args[0]) == defaultGroup) p.setResult(false);
+                }
+            });
+            Log.i(TAG, "Pocket touch timeout hook installed");
+        } catch (Throwable t) {
+            Log.w(TAG, "Touch timeout hook unavailable; using pocket window input flag", t);
+        }
+    }
+
+    private static void installTapWakeHook(ClassLoader loader) {
+        try {
+            Class<?> service = XposedHelpers.findClass("com.android.server.power.PowerManagerService", loader);
+            Class<?> groupClass = XposedHelpers.findClass("com.android.server.power.PowerGroup", loader);
+            Method getId = XposedHelpers.findMethodExact(groupClass, "getGroupId");
+            Method getState = XposedHelpers.findMethodExact(groupClass, "getWakefulnessLocked");
+            Method lastSleep = XposedHelpers.findMethodExact(groupClass, "getLastSleepTimeLocked");
+            XposedHelpers.findAndHookMethod(service, "wakePowerGroupLocked", groupClass, long.class,
+                    int.class, String.class, int.class, String.class, int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) throws Throwable {
+                    // TAP (15) is used by SystemUI DozeService. Touch drivers may instead
+                    // report the policy GESTURE (4) or touchscreen MOTION (7) path.
+                    int reason = (int) p.args[2];
+                    String details = (String) p.args[3];
+                    if (reason != 15 && !(reason == 4 && ("android.policy:GESTURE".equals(details)
+                            || (details != null && details.toLowerCase(java.util.Locale.ROOT).contains("tap"))))
+                            && !(reason == 7 && "android.policy:MOTION".equals(details))) return;
+                    CrPocketController c = controller;
+                    Object group = p.args[0];
+                    if (group == null || c == null || !c.canCheckPowerWake()
+                            || (int) getId.invoke(group) != 0) return;
+                    int state = (int) getState.invoke(group);
+                    if (state != 0 && state != 3) return; // only asleep or dozing
+                    Object owner = p.thisObject;
+                    Object lock = XposedHelpers.getObjectField(owner, "mLock");
+                    Object[] args = p.args.clone();
+                    Method method = (Method) p.method;
+                    long sleep = (long) lastSleep.invoke(group);
+                    Log.i(TAG, "Tap wake: checking proximity before display, reason=" + reason
+                            + " details=" + details);
+                    c.preparePowerWake(() -> {
+                        // This method normally runs under the service lock. Never wait
+                        // for sensors with it held or replay a wake after a newer sleep.
+                        synchronized (lock) {
+                            try {
+                                android.util.SparseArray<?> groups = (android.util.SparseArray<?>)
+                                        XposedHelpers.getObjectField(owner, "mPowerGroups");
+                                if (groups.get(0) == group && (long) lastSleep.invoke(group) == sleep)
+                                    XposedBridge.invokeOriginalMethod(method, owner, args);
+                            } catch (Throwable t) {
+                                Log.e(TAG, "Could not resume tap wake", t);
+                            }
+                        }
+                    });
+                    p.setResult(null);
+                }
+            });
+            Log.i(TAG, "Tap wake hook installed");
+        } catch (Throwable t) {
+            Log.w(TAG, "Power-group tap hook unavailable", t);
+        }
+    }
+
     static void install(XC_LoadPackage.LoadPackageParam lp) {
+        installTouchTimeoutHook(lp.classLoader);
+        PocketDreamHook.install(lp.classLoader);
+        installTapWakeHook(lp.classLoader);
         try {
             Class<?> policy = XposedHelpers.findClassIfExists(
                     "com.android.server.policy.PhoneWindowManager", lp.classLoader);
@@ -35,55 +155,90 @@ public final class PocketPowerHook {
                 Log.e(TAG, "PhoneWindowManager missing; feature disabled");
                 return;
             }
-            Set<XC_MethodHook.Unhook> longHooks = XposedBridge.hookAllMethods(
-                    policy, "powerLongPress", new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam param) {
-                            CrPocketController c = controller;
-                            if (c == null || !c.isOverlayShowing()) return;
-                            try {
-                                XposedHelpers.setBooleanField(
-                                        param.thisObject, "mPowerKeyHandled", true);
-                                consumeVeryLongUntilKeyUp = true;
-                                c.exitOnLongPower();
-                                param.setResult(null);
-                                Log.i(TAG, "Long POWER dismissed pocket overlay (no power menu)");
-                            } catch (Throwable t) {
-                                Log.e(TAG, "Power key override failed; retain stock behavior", t);
-                            }
-                        }
-                    });
-            if (longHooks.isEmpty()) {
-                Log.e(TAG, "powerLongPress not present; refuse to enable pocket lock");
+            XC_MethodHook menu = new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (suppressMenu()) {
+                        XposedHelpers.setBooleanField(p.thisObject, "mPowerKeyHandled", true);
+                        p.setResult(null);
+                    }
+                }
+            };
+            if (XposedBridge.hookAllMethods(policy, "powerLongPress", menu).isEmpty()) return;
+            XposedBridge.hookAllMethods(policy, "powerVeryLongPress", menu);
+            if (XposedBridge.hookAllMethods(policy, "interceptPowerKeyDown", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (p.args.length > 0 && p.args[0] instanceof KeyEvent)
+                        beginHold(p.thisObject, (KeyEvent) p.args[0]);
+                }
+            }).isEmpty()) return;
+            if (XposedBridge.hookAllMethods(policy, "interceptPowerKeyUp", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) { endHold(); }
+            }).isEmpty()) return;
+
+            // Hook the final primitive overload so both key-down and ROMs
+            // that wake on key-up pass through the same check exactly once.
+            Method wakeMethod = null;
+            for (Method method : policy.getDeclaredMethods()) {
+                if (!method.getName().equals("wakeUpFromWakeKey")
+                        || method.getReturnType() != void.class) continue;
+                Class<?>[] args = method.getParameterTypes();
+                boolean legacy = java.util.Arrays.equals(args,
+                        new Class<?>[]{long.class, int.class, boolean.class});
+                boolean modern = java.util.Arrays.equals(args,
+                        new Class<?>[]{int.class, long.class, int.class, boolean.class, int.class})
+                        || java.util.Arrays.equals(args, new Class<?>[]{int.class, long.class,
+                                int.class, boolean.class, int.class, boolean.class});
+                if ((modern || legacy) && (wakeMethod == null
+                        || args.length > wakeMethod.getParameterCount())) wakeMethod = method;
+            }
+            if (wakeMethod == null) {
+                Log.e(TAG, "Unsupported wakeUpFromWakeKey signature");
                 return;
             }
-            Set<XC_MethodHook.Unhook> veryLongHooks = XposedBridge.hookAllMethods(
-                    policy, "powerVeryLongPress", new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam param) {
-                            CrPocketController c = controller;
-                            if (!consumeVeryLongUntilKeyUp &&
-                                    (c == null || !c.isOverlayShowing())) return;
-                            try {
-                                XposedHelpers.setBooleanField(
-                                        param.thisObject, "mPowerKeyHandled", true);
-                                if (!consumeVeryLongUntilKeyUp && c != null)
-                                    c.exitOnLongPower();
-                                consumeVeryLongUntilKeyUp = true;
-                                param.setResult(null);
-                            } catch (Throwable t) {
-                                Log.e(TAG, "Very-long POWER override failed", t);
-                            }
+            final int keyIndex = wakeMethod.getParameterCount() == 3 ? 1 : 2;
+            XposedBridge.hookMethod(wakeMethod, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    CrPocketController c = controller;
+                    int key = (int) p.args[keyIndex];
+                    if (c == null || !c.canCheckPowerWake()
+                            || (key != KeyEvent.KEYCODE_POWER && key != KeyEvent.KEYCODE_WAKEUP)) return;
+                    Context ctx = (Context) XposedHelpers.getObjectField(p.thisObject, "mContext");
+                    if (ctx.getSystemService(PowerManager.class).isInteractive()) return;
+                    Object policyObject = p.thisObject;
+                    Object[] args = p.args.clone();
+                    Method method = (Method) p.method;
+                    c.preparePowerWake(() -> handler.post(() -> {
+                        try {
+                            XposedBridge.invokeOriginalMethod(method, policyObject, args);
+                        } catch (Throwable t) {
+                            Log.e(TAG, "Could not resume power wake", t);
                         }
-                    });
-            if (veryLongHooks.isEmpty()) {
-                Log.e(TAG, "Cannot suppress very-long software power menu");
-                return;
-            }
-            XposedBridge.hookAllMethods(policy, "interceptPowerKeyUp",
+                    }));
+                    p.setResult(null);
+                }
+            });
+
+            Class<?> listenerType = XposedHelpers.findClass(
+                    "com.android.server.policy.WindowManagerPolicy$ScreenOnListener", lp.classLoader);
+            XposedHelpers.findAndHookMethod(policy, "screenTurningOn", int.class, listenerType,
                     new XC_MethodHook() {
-                        @Override protected void afterHookedMethod(MethodHookParam param) {
-                            consumeVeryLongUntilKeyUp = false;
-                        }
-                    });
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    CrPocketController c = controller;
+                    Object original = p.args[1];
+                    if ((int) p.args[0] != Display.DEFAULT_DISPLAY || c == null
+                            || !c.canCheckPowerWake() || original == null) return;
+                    if (!c.isManualWake()) return;
+                    p.args[1] = Proxy.newProxyInstance(listenerType.getClassLoader(),
+                            new Class<?>[]{listenerType}, (proxy, method, args) -> {
+                                if (!method.getName().equals("onScreenOn"))
+                                    return method.invoke(original, args);
+                                Runnable unblock = () -> handler.post(() ->
+                                        XposedHelpers.callMethod(original, "onScreenOn"));
+                                c.whenScreenReady(unblock);
+                                return null;
+                            });
+                }
+            });
             escapeInstalled = true;
             Set<XC_MethodHook.Unhook> readyHooks = XposedBridge.hookAllMethods(
                     policy, "systemReady", new XC_MethodHook() {
@@ -93,6 +248,7 @@ public final class PocketPowerHook {
                                 Context context = (Context) XposedHelpers.getObjectField(
                                         param.thisObject, "mContext");
                                 if (context == null) return;
+                                handler = (Handler) XposedHelpers.getObjectField(param.thisObject, "mHandler");
                                 CrPocketController instance = new CrPocketController(context);
                                 instance.init();
                                 controller = instance;

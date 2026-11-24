@@ -12,7 +12,7 @@ import android.os.Bundle;
 import android.os.Process;
 
 /**
- * Device-protected, read-only IPC bridge from the module app to SystemUI.
+ * Device-protected configuration shared by the module, system Settings and the hooks.
  * Config writes happen only inside the module app and notify observers.
  */
 public final class ConfigProvider extends ContentProvider {
@@ -21,9 +21,18 @@ public final class ConfigProvider extends ContentProvider {
     public static final String PREF_FILE = "pocketmode";
     public static final String KEY_ENABLED = "enabled";
 
+    static final String KEY_DELAY = "unlocked_cover_seconds";
+    static final int DEFAULT_DELAY = 1;
+    static final int MAX_DELAY = 15;
+
     public static SharedPreferences preferences(Context c) {
         return c.createDeviceProtectedStorageContext()
                 .getSharedPreferences(PREF_FILE, Context.MODE_PRIVATE);
+    }
+
+    static void setEnabled(Context c, boolean enabled) {
+        preferences(c).edit().putBoolean(KEY_ENABLED, enabled).apply();
+        notifyUpdated(c);
     }
 
     public static void notifyUpdated(Context c) {
@@ -39,19 +48,45 @@ public final class ConfigProvider extends ContentProvider {
         String[] packages = pm.getPackagesForUid(uid);
         if (packages != null) {
             for (String pkg : packages) {
-                if ("com.android.systemui".equals(pkg)) return;
+                if ("com.android.systemui".equals(pkg) || "com.android.settings".equals(pkg)) return;
             }
         }
         throw new SecurityException("PocketMode config may only be read by Android framework");
     }
 
     @Override public Bundle call(String method, String arg, Bundle extras) {
+        if ("set".equals(method) || "setDelay".equals(method)) {
+            try {
+                int settingsUid = getContext().getPackageManager().getPackageUid("com.android.settings", 0);
+                if (Binder.getCallingUid() != settingsUid)
+                    throw new SecurityException("Only system Settings may change pocket protection");
+            } catch (PackageManager.NameNotFoundException e) {
+                throw new SecurityException("Settings unavailable", e);
+            }
+            boolean delay = "setDelay".equals(method);
+            if (extras == null || !extras.containsKey(delay ? KEY_DELAY : KEY_ENABLED))
+                throw new IllegalArgumentException("Missing preference value");
+            long identity = Binder.clearCallingIdentity();
+            try {
+                if (delay) {
+                    int seconds = extras.getInt(KEY_DELAY);
+                    if (seconds < 1 || seconds > MAX_DELAY) throw new IllegalArgumentException("Invalid delay");
+                    preferences(getContext()).edit().putInt(KEY_DELAY, seconds).apply();
+                    notifyUpdated(getContext());
+                } else {
+                    setEnabled(getContext(), extras.getBoolean(KEY_ENABLED));
+                }
+            }
+            finally { Binder.restoreCallingIdentity(identity); }
+            return new Bundle();
+        }
         enforceReader();
         if (!"get".equals(method)) throw new IllegalArgumentException("Unknown method");
         SharedPreferences prefs = preferences(getContext());
         Bundle out = new Bundle();
-        // First-install default = ON. The user can turn it off from the launcher UI.
+        // Preserve the enabled-by-default behavior for existing installations.
         out.putBoolean(KEY_ENABLED, prefs.getBoolean(KEY_ENABLED, true));
+        out.putInt(KEY_DELAY, prefs.getInt(KEY_DELAY, DEFAULT_DELAY));
         return out;
     }
 
