@@ -23,6 +23,7 @@ final class GestureSettingsHook {
     private static final String WATCH = KEY + ".observer";
 
     static void install(ClassLoader loader) {
+        installSliderBinding(loader);
         try {
             Class<?> page = XposedHelpers.findClass(PAGE, loader);
             hookLifecycle(page, "onResume", new XC_MethodHook() {
@@ -64,6 +65,30 @@ final class GestureSettingsHook {
         } catch (Throwable t) { Log.e(TAG, "Gestures integration unavailable", t); }
     }
 
+    private static void installSliderBinding(ClassLoader loader) {
+        try {
+            Class<?> holder = XposedHelpers.findClass("androidx.preference.PreferenceViewHolder", loader);
+            XposedHelpers.findAndHookMethod("androidx.preference.Preference", loader,
+                    "onBindViewHolder", holder, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    android.view.View item = (android.view.View) XposedHelpers.getObjectField(p.args[0], "itemView");
+                    boolean pocket = KEY.equals(XposedHelpers.callMethod(p.thisObject, "getKey"));
+                    PocketDelaySlider existing = item.findViewWithTag(PocketDelaySlider.TAG);
+                    if (!pocket) {
+                        if (existing != null) existing.detach();
+                        return;
+                    }
+                    android.widget.TextView summary = item.findViewById(android.R.id.summary);
+                    if (summary == null) return;
+                    PocketDelaySlider slider = existing != null ? existing : PocketDelaySlider.attach(summary);
+                    Bundle extras = (Bundle) XposedHelpers.callMethod(p.thisObject, "getExtras");
+                    slider.bind((boolean) XposedHelpers.callMethod(p.thisObject, "isChecked"),
+                            extras.getInt(ConfigProvider.KEY_DELAY, ConfigProvider.DEFAULT_DELAY));
+                }
+            });
+        } catch (Throwable e) { Log.e(TAG, "Pocket slider binding unavailable", e); }
+    }
+
     private static void hookLifecycle(Class<?> type, String name, XC_MethodHook hook)
             throws NoSuchMethodException {
         for (Class<?> c = type; c != null; c = c.getSuperclass()) {
@@ -93,36 +118,18 @@ final class GestureSettingsHook {
             XposedHelpers.callMethod(row, "setTitle", "口袋模式");
             XposedHelpers.callMethod(row, "setSummary", "遮挡距离传感器时启用防误触保护");
             XposedHelpers.callMethod(row, "setPersistent", false);
-            bindChange(ctx, loader, row, false);
+            bindChange(ctx, loader, row);
             XposedHelpers.callMethod(screen, "addPreference", row);
         }
-        String delayKey = KEY + ".cover_delay";
-        Object slider = XposedHelpers.callMethod(screen, "findPreference", delayKey);
-        if (slider == null) {
-            Context themed = (Context) XposedHelpers.callMethod(screen, "getContext");
-            slider = XposedHelpers.newInstance(XposedHelpers.findClass(
-                    "androidx.preference.SeekBarPreference", loader), themed);
-            XposedHelpers.callMethod(slider, "setKey", delayKey);
-            XposedHelpers.callMethod(slider, "setTitle", "连续遮挡时间（秒）");
-            XposedHelpers.callMethod(slider, "setSummary", "仅在亮屏且已解锁时生效");
-            XposedHelpers.callMethod(slider, "setPersistent", false);
-            XposedHelpers.callMethod(slider, "setMin", 1);
-            XposedHelpers.callMethod(slider, "setMax", ConfigProvider.MAX_DELAY);
-            XposedHelpers.callMethod(slider, "setSeekBarIncrement", 1);
-            XposedHelpers.callMethod(slider, "setShowSeekBarValue", true);
-            bindChange(ctx, loader, slider, true);
-            XposedHelpers.callMethod(screen, "addPreference", slider);
-        }
-        final Object delaySlider = slider;
         final Object pref = row;
         if (XposedHelpers.getAdditionalInstanceField(page, WATCH) == null) {
             ContentObserver observer = new ContentObserver(new Handler(Looper.getMainLooper())) {
-                @Override public void onChange(boolean selfChange) { refresh(ctx, pref, delaySlider); }
+                @Override public void onChange(boolean selfChange) { refresh(ctx, pref); }
             };
             ctx.getContentResolver().registerContentObserver(ConfigProvider.URI, false, observer);
             XposedHelpers.setAdditionalInstanceField(page, WATCH, observer);
         }
-        refresh(ctx, row, delaySlider);
+        refresh(ctx, row);
         Bundle args = (Bundle) XposedHelpers.callMethod(page, "getArguments");
         if (args != null && args.getBoolean(MainActivity.OPEN_GESTURES)) {
             args.remove(MainActivity.OPEN_GESTURES);
@@ -130,16 +137,15 @@ final class GestureSettingsHook {
         }
     }
 
-    private static void bindChange(Context ctx, ClassLoader loader, Object row, boolean delay) {
+    private static void bindChange(Context ctx, ClassLoader loader, Object row) {
         Class<?> listener = XposedHelpers.findClass(
                 "androidx.preference.Preference$OnPreferenceChangeListener", loader);
         Object change = Proxy.newProxyInstance(loader, new Class<?>[]{listener}, (proxy, m, args) -> {
             if (m.getName().equals("onPreferenceChange")) {
                 Bundle values = new Bundle();
-                if (delay) values.putInt(ConfigProvider.KEY_DELAY, (int) args[1]);
-                else values.putBoolean(ConfigProvider.KEY_ENABLED, (boolean) args[1]);
+                values.putBoolean(ConfigProvider.KEY_ENABLED, (boolean) args[1]);
                 return ctx.getContentResolver().call(ConfigProvider.URI,
-                        delay ? "setDelay" : "set", null, values) != null;
+                        "set", null, values) != null;
             }
             if (m.getName().equals("hashCode")) return System.identityHashCode(proxy);
             if (m.getName().equals("equals")) return proxy == args[0];
@@ -148,14 +154,16 @@ final class GestureSettingsHook {
         XposedHelpers.callMethod(row, "setOnPreferenceChangeListener", change);
     }
 
-    private static void refresh(Context ctx, Object row, Object slider) {
+    private static void refresh(Context ctx, Object row) {
         try {
             Bundle b = ctx.getContentResolver().call(ConfigProvider.URI, "get", null, null);
             if (b == null) return;
             boolean enabled = b.getBoolean(ConfigProvider.KEY_ENABLED, true);
             XposedHelpers.callMethod(row, "setChecked", enabled);
-            XposedHelpers.callMethod(slider, "setValue", b.getInt(ConfigProvider.KEY_DELAY, ConfigProvider.DEFAULT_DELAY));
-            XposedHelpers.callMethod(slider, "setEnabled", enabled);
+            int seconds = b.getInt(ConfigProvider.KEY_DELAY, ConfigProvider.DEFAULT_DELAY);
+            Bundle extras = (Bundle) XposedHelpers.callMethod(row, "getExtras");
+            extras.putInt(ConfigProvider.KEY_DELAY, seconds);
+            XposedHelpers.callMethod(row, "setSummary", PocketDelaySlider.label(seconds));
         } catch (RuntimeException e) { Log.e(TAG, "Cannot read pocket setting", e); }
     }
 }

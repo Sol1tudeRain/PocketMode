@@ -6,8 +6,8 @@ android {
         applicationId 'org.pocketguard.lsp'
         minSdk 29
         targetSdk 35
-        versionCode 27
-        versionName '2.7-cover-delay'
+        versionCode 28
+        versionName '2.8-inline-slider'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

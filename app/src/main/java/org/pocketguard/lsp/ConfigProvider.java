@@ -23,7 +23,7 @@ public final class ConfigProvider extends ContentProvider {
 
     static final String KEY_DELAY = "unlocked_cover_seconds";
     static final int DEFAULT_DELAY = 1;
-    static final int MAX_DELAY = 5;
+    static final int MAX_DELAY = 15;
 
     public static SharedPreferences preferences(Context c) {
         return c.createDeviceProtectedStorageContext()
