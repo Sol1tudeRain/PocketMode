@@ -1,10 +1,10 @@
-# PocketMode v2.4
+# PocketMode v2.5
 
 Based on v1.9 for PixelOS. Select Android System Framework (`android`) and System UI (`com.android.systemui`) in
 LSPosed and reboot after installing.
 
 System UI samples proximity before a notification pulse. A covered sample suppresses the pulse.
-While the display is off, physical POWER also triggers a proximity check.
+While the display is off, physical POWER and supported tap-to-wake requests also trigger a proximity check.
 At that point the controller checks proximity before resuming the normal
 wake. When covered it prepares the opaque pocket window and gesture shield.
 If rendering requires the display to start, it can delay the default

@@ -91,9 +91,63 @@ public final class PocketPowerHook {
         }
     }
 
+    private static void installTapWakeHook(ClassLoader loader) {
+        try {
+            Class<?> service = XposedHelpers.findClass("com.android.server.power.PowerManagerService", loader);
+            Class<?> groupClass = XposedHelpers.findClass("com.android.server.power.PowerGroup", loader);
+            Method getId = XposedHelpers.findMethodExact(groupClass, "getGroupId");
+            Method getState = XposedHelpers.findMethodExact(groupClass, "getWakefulnessLocked");
+            Method lastSleep = XposedHelpers.findMethodExact(groupClass, "getLastSleepTimeLocked");
+            XposedHelpers.findAndHookMethod(service, "wakePowerGroupLocked", groupClass, long.class,
+                    int.class, String.class, int.class, String.class, int.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) throws Throwable {
+                    // TAP (15) is used by SystemUI DozeService. Touch drivers may instead
+                    // report the policy GESTURE (4) or touchscreen MOTION (7) path.
+                    int reason = (int) p.args[2];
+                    String details = (String) p.args[3];
+                    if (reason != 15 && !(reason == 4 && ("android.policy:GESTURE".equals(details)
+                            || (details != null && details.toLowerCase(java.util.Locale.ROOT).contains("tap"))))
+                            && !(reason == 7 && "android.policy:MOTION".equals(details))) return;
+                    CrPocketController c = controller;
+                    Object group = p.args[0];
+                    if (group == null || c == null || !c.canCheckPowerWake()
+                            || (int) getId.invoke(group) != 0) return;
+                    int state = (int) getState.invoke(group);
+                    if (state != 0 && state != 3) return; // only asleep or dozing
+                    Object owner = p.thisObject;
+                    Object lock = XposedHelpers.getObjectField(owner, "mLock");
+                    Object[] args = p.args.clone();
+                    Method method = (Method) p.method;
+                    long sleep = (long) lastSleep.invoke(group);
+                    Log.i(TAG, "Tap wake: checking proximity before display, reason=" + reason
+                            + " details=" + details);
+                    c.preparePowerWake(() -> {
+                        // This method normally runs under the service lock. Never wait
+                        // for sensors with it held or replay a wake after a newer sleep.
+                        synchronized (lock) {
+                            try {
+                                android.util.SparseArray<?> groups = (android.util.SparseArray<?>)
+                                        XposedHelpers.getObjectField(owner, "mPowerGroups");
+                                if (groups.get(0) == group && (long) lastSleep.invoke(group) == sleep)
+                                    XposedBridge.invokeOriginalMethod(method, owner, args);
+                            } catch (Throwable t) {
+                                Log.e(TAG, "Could not resume tap wake", t);
+                            }
+                        }
+                    });
+                    p.setResult(null);
+                }
+            });
+            Log.i(TAG, "Tap wake hook installed");
+        } catch (Throwable t) {
+            Log.w(TAG, "Power-group tap hook unavailable", t);
+        }
+    }
+
     static void install(XC_LoadPackage.LoadPackageParam lp) {
         installTouchTimeoutHook(lp.classLoader);
         PocketDreamHook.install(lp.classLoader);
+        installTapWakeHook(lp.classLoader);
         try {
             Class<?> policy = XposedHelpers.findClassIfExists(
                     "com.android.server.policy.PhoneWindowManager", lp.classLoader);
@@ -145,8 +199,9 @@ public final class PocketPowerHook {
             XposedBridge.hookMethod(wakeMethod, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     CrPocketController c = controller;
+                    int key = (int) p.args[keyIndex];
                     if (c == null || !c.canCheckPowerWake()
-                            || (int) p.args[keyIndex] != KeyEvent.KEYCODE_POWER) return;
+                            || (key != KeyEvent.KEYCODE_POWER && key != KeyEvent.KEYCODE_WAKEUP)) return;
                     Context ctx = (Context) XposedHelpers.getObjectField(p.thisObject, "mContext");
                     if (ctx.getSystemService(PowerManager.class).isInteractive()) return;
                     Object policyObject = p.thisObject;
